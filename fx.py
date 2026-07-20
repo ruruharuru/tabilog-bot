@@ -1,6 +1,8 @@
 """
 為替レート取得モジュール
-frankfurter.app という無料API（APIキー不要）を使って現地通貨→JPYのレートを取得する。
+open.er-api.com（ExchangeRate-APIの無料オープンエンドポイント、APIキー不要）を使う。
+frankfurter.app はECB基準のため主要30通貨程度しか扱えずマイナー通貨で404になっていたので、
+166通貨に対応したこちらに切り替えている。
 軽くキャッシュして、同じ通貨への無駄なリクエストを減らす。
 """
 import time
@@ -25,14 +27,17 @@ def get_rate_to_jpy(currency: str) -> float:
     if cached and (now - cached["time"] < _CACHE_TTL):
         return cached["rate"]
 
-    url = f"https://api.frankfurter.app/latest?from={currency}&to=JPY"
+    url = f"https://open.er-api.com/v6/latest/{currency}"
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.json()
 
-    rate = data["rates"].get("JPY")
+    if data.get("result") != "success":
+        raise ValueError(f"通貨コード '{currency}' は認識されませんでした。ISO 4217コードを確認してください。")
+
+    rate = data.get("rates", {}).get("JPY")
     if rate is None:
-        raise ValueError(f"通貨コード '{currency}' のレートが取得できませんでした")
+        raise ValueError(f"通貨コード '{currency}' のJPYレートが見つかりませんでした")
 
     _CACHE[currency] = {"rate": rate, "time": now}
     return rate
