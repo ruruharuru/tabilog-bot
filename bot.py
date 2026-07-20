@@ -12,6 +12,7 @@ TabiLog Bot - 世界一周の費用ログ用Discord Bot
   /log_rm   IDを指定して削除
   /log_wari 割り勘の精算計算
 """
+import asyncio
 import os
 import logging
 from collections import defaultdict
@@ -21,6 +22,7 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import countries
 import fx
 from sheets import SheetStore
 
@@ -36,6 +38,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 store: SheetStore | None = None
+_country_cache: dict[str, str] = {}  # channel_id -> country
 
 
 def get_store() -> SheetStore:
@@ -43,6 +46,50 @@ def get_store() -> SheetStore:
     if store is None:
         store = SheetStore()
     return store
+
+
+async def run_sync(func, *args, **kwargs):
+    """同期の Sheets / HTTP 呼び出しでイベントループを塞がない。"""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+def _resolve_country(channel_id) -> str:
+    key = str(channel_id)
+    if key in _country_cache:
+        return _country_cache[key]
+    country = get_store().get_country_for_channel(channel_id) or DEFAULT_COUNTRY
+    if country != DEFAULT_COUNTRY:
+        _country_cache[key] = country
+    return country
+
+
+def _save_entry(
+    entry_type: str,
+    channel_id,
+    country: str,
+    amount_local: float,
+    currency: str,
+    tags: str,
+    memo: str,
+    split_on: bool,
+    payer_id: str,
+) -> tuple[int, float, float]:
+    amount_jpy, rate = fx.convert_to_jpy(amount_local, currency)
+    entry_id = get_store().add_entry(
+        entry_type=entry_type,
+        channel_id=channel_id,
+        country=country,
+        amount_local=amount_local,
+        currency=currency,
+        rate=rate,
+        amount_jpy=amount_jpy,
+        tags=tags,
+        memo=memo,
+        split=split_on,
+        payer_id=payer_id,
+        participants="",
+    )
+    return entry_id, amount_jpy, rate
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +105,8 @@ class EntryModal(discord.ui.Modal):
             label="金額", placeholder="例: 250", required=True, max_length=20
         )
         self.currency = discord.ui.TextInput(
-            label="通貨（現地通貨コード。日本円ならJPYか空欄）",
-            placeholder="例: THB / USD / JPY",
+            label="通貨（空欄で国から自動）",
+            placeholder="例: THB / USD / 空欄で自動",
             required=False,
             max_length=10,
         )
@@ -96,38 +143,36 @@ class EntryModal(discord.ui.Modal):
             )
             return
 
-        currency = (self.currency.value or "JPY").strip().upper()
+        await interaction.response.defer()
+
         tags = self.tags.value.strip()
         memo = self.memo.value.strip()
         split_on = bool(self.split and self.split.value.strip().lower() == "on")
-
-        st = get_store()
         channel_id = interaction.channel_id
-        country = st.get_country_for_channel(channel_id) or DEFAULT_COUNTRY
+        currency_input = (self.currency.value or "").strip().upper()
 
         try:
-            amount_jpy, rate = fx.convert_to_jpy(amount_local, currency)
+            country = await run_sync(_resolve_country, channel_id)
+            currency = currency_input or countries.get_currency_for_country(country) or "JPY"
+            entry_id, amount_jpy, _rate = await run_sync(
+                _save_entry,
+                self.entry_type,
+                channel_id,
+                country,
+                amount_local,
+                currency,
+                tags,
+                memo,
+                split_on,
+                str(interaction.user.id) if split_on else "",
+            )
         except Exception as e:
-            await interaction.response.send_message(
-                f"為替レートの取得に失敗しました: {e}\n通貨コードを確認してください。",
+            log.exception("entry submit failed")
+            await interaction.followup.send(
+                f"記録に失敗しました: {e}\n少し待ってからもう一度送信してください。",
                 ephemeral=True,
             )
             return
-
-        entry_id = st.add_entry(
-            entry_type=self.entry_type,
-            channel_id=channel_id,
-            country=country,
-            amount_local=amount_local,
-            currency=currency,
-            rate=rate,
-            amount_jpy=amount_jpy,
-            tags=tags,
-            memo=memo,
-            split=split_on,
-            payer_id=str(interaction.user.id) if split_on else "",
-            participants="",
-        )
 
         embed = discord.Embed(
             title=f"✅ 記録しました (ID: {entry_id})",
@@ -148,7 +193,7 @@ class EntryModal(discord.ui.Modal):
         if country == DEFAULT_COUNTRY:
             embed.set_footer(text="国が未設定のチャンネルです。/log_ed で後から修正できます。")
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
         if split_on:
             view = ParticipantSelectView(entry_id=entry_id, payer_id=interaction.user.id)
@@ -179,11 +224,15 @@ class ParticipantSelectView(discord.ui.View):
         chosen_ids.add(str(self.payer_id))  # 支払者は必ず含める
         participants_str = ",".join(sorted(chosen_ids))
 
-        st = get_store()
-        st.update_split_participants(self.entry_id, participants_str)
+        await interaction.response.defer()
+        try:
+            await run_sync(get_store().update_split_participants, self.entry_id, participants_str)
+        except Exception as e:
+            await interaction.followup.send(f"参加者の保存に失敗しました: {e}", ephemeral=True)
+            return
 
         names = ", ".join(f"<@{uid}>" for uid in chosen_ids)
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=f"✅ ID {self.entry_id} の割り勘参加者を設定しました: {names}",
             view=None,
         )
@@ -196,6 +245,7 @@ class ParticipantSelectView(discord.ui.View):
 @bot.event
 async def on_ready():
     try:
+        await run_sync(get_store)
         synced = await bot.tree.sync()
         log.info(f"synced {len(synced)} commands")
     except Exception as e:
@@ -216,9 +266,14 @@ async def log_in(interaction: discord.Interaction):
 @bot.tree.command(name="log_ct", description="このチャンネルを国/地域に紐付けます")
 @app_commands.describe(country="紐付ける国/地域名（例: タイ）")
 async def log_ct(interaction: discord.Interaction, country: str):
-    st = get_store()
-    st.bind_channel_country(interaction.channel_id, country)
-    await interaction.response.send_message(
+    await interaction.response.defer()
+    try:
+        await run_sync(get_store().bind_channel_country, interaction.channel_id, country)
+        _country_cache[str(interaction.channel_id)] = country
+    except Exception as e:
+        await interaction.followup.send(f"国の登録に失敗しました: {e}", ephemeral=True)
+        return
+    await interaction.followup.send(
         f"✅ このチャンネルを「{country}」に固定しました。以後 /log_ex や /log_in で国は自動設定されます。"
     )
 
