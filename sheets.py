@@ -4,6 +4,12 @@ Google Sheets 操作モジュール
   - "Log"      : 収支の記録本体
   - "Channels" : チャンネルID <-> 国 の紐付け
 存在しない場合は自動で作成する。
+
+【重要】DiscordのIDは18〜19桁なので、Sheetsには必ずRAW文字列として書き込む。
+特にカンマ区切りの参加者IDをUSER_ENTEREDで書くと巨大な数値として解釈され、
+精度が失われて正しいメンションに戻せなくなる。
+また読み取り時、gspreadのnumericiseはカンマを千位区切りとして削除するため、
+ID列は numericise_ignore で除外する必要がある。
 """
 import os
 import json
@@ -22,12 +28,24 @@ LOG_HEADERS = [
 ]
 CHANNEL_HEADERS = ["チャンネルID", "国"]
 
+ID_LIKE_FIELDS = {"チャンネルID", "支払者ID", "参加者ID"}
+
 
 def _get_client():
     creds_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     info = json.loads(creds_json)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
+
+
+def _clean_id_text(value) -> str:
+    """過去にテキスト化のため付けたアポストロフィを読み取り時に除く。"""
+    return str(value).strip().lstrip("'")
+
+
+def _id_column_indexes(headers: list[str]) -> list[int]:
+    """gspreadのnumericiseがカンマを千位区切りとして消すのを避ける列番号(1始まり)。"""
+    return [headers.index(name) + 1 for name in ID_LIKE_FIELDS if name in headers]
 
 
 class SheetStore:
@@ -43,28 +61,34 @@ class SheetStore:
             ws = self.ss.worksheet(title)
         except gspread.WorksheetNotFound:
             ws = self.ss.add_worksheet(title=title, rows=1000, cols=len(headers) + 2)
-            ws.append_row(headers)
+            ws.append_row(headers, value_input_option="RAW")
             return ws
         # ヘッダーが無ければ追加
         first_row = ws.row_values(1)
         if not first_row:
-            ws.append_row(headers)
+            ws.append_row(headers, value_input_option="RAW")
         return ws
 
     # ---------- Channel <-> Country ----------
 
     def bind_channel_country(self, channel_id: str, country: str):
-        records = self.channel_ws.get_all_records()
+        records = self.channel_ws.get_all_records(
+            numericise_ignore=_id_column_indexes(CHANNEL_HEADERS)
+        )
         for i, row in enumerate(records, start=2):  # 2行目からデータ
-            if str(row["チャンネルID"]) == str(channel_id):
-                self.channel_ws.update_cell(i, 2, country)
+            if _clean_id_text(row["チャンネルID"]) == str(channel_id):
+                self.channel_ws.update([[country]], range_name=f"B{i}", raw=True)
                 return
-        self.channel_ws.append_row([str(channel_id), country])
+        self.channel_ws.append_row(
+            [str(channel_id), country], value_input_option="RAW"
+        )
 
     def get_country_for_channel(self, channel_id: str) -> str | None:
-        records = self.channel_ws.get_all_records()
+        records = self.channel_ws.get_all_records(
+            numericise_ignore=_id_column_indexes(CHANNEL_HEADERS)
+        )
         for row in records:
-            if str(row["チャンネルID"]) == str(channel_id):
+            if _clean_id_text(row["チャンネルID"]) == str(channel_id):
                 return row["国"]
         return None
 
@@ -95,13 +119,22 @@ class SheetStore:
         row = [
             new_id, entry_type, now, str(channel_id), country,
             amount_local, currency.upper(), rate, amount_jpy,
-            tags, memo, "ON" if split else "OFF", str(payer_id), participants,
+            tags, memo, "ON" if split else "OFF",
+            str(payer_id) if payer_id else "",
+            str(participants),
         ]
-        self.log_ws.append_row(row)
+        self.log_ws.append_row(row, value_input_option="RAW")
         return new_id
 
     def get_all_entries(self) -> list[dict]:
-        return self.log_ws.get_all_records()
+        # 参加者IDは「id1,id2」形式。numericiseするとカンマが消えて1つの巨大数値になる。
+        records = self.log_ws.get_all_records(
+            numericise_ignore=_id_column_indexes(LOG_HEADERS)
+        )
+        for row in records:
+            for field in ID_LIKE_FIELDS:
+                row[field] = _clean_id_text(row.get(field, ""))
+        return records
 
     def find_row_by_id(self, entry_id: int) -> int | None:
         ids = self.log_ws.col_values(1)[1:]
@@ -110,14 +143,16 @@ class SheetStore:
                 return i
         return None
 
-    def update_field(self, entry_id: int, field: str, value: str) -> bool:
+    def update_field(self, entry_id: int, field: str, value) -> bool:
         row_idx = self.find_row_by_id(entry_id)
         if row_idx is None:
             return False
         if field not in LOG_HEADERS:
             return False
         col_idx = LOG_HEADERS.index(field) + 1
-        self.log_ws.update_cell(row_idx, col_idx, value)
+        write_value = str(value) if field in ID_LIKE_FIELDS else value
+        cell = gspread.utils.rowcol_to_a1(row_idx, col_idx)
+        self.log_ws.update([[write_value]], range_name=cell, raw=True)
         return True
 
     def update_split_participants(self, entry_id: int, participants: str):
@@ -125,7 +160,8 @@ class SheetStore:
         if row_idx is None:
             return False
         col_idx = LOG_HEADERS.index("参加者ID") + 1
-        self.log_ws.update_cell(row_idx, col_idx, participants)
+        cell = gspread.utils.rowcol_to_a1(row_idx, col_idx)
+        self.log_ws.update([[str(participants)]], range_name=cell, raw=True)
         return True
 
     def delete_entry(self, entry_id: int) -> bool:
