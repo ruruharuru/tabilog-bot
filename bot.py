@@ -12,7 +12,7 @@ TabiLog Bot - 世界一周の費用ログ用Discord Bot
   /log_all     全体サマリー
   /log_ls      ID付き一覧表示
   /log_ed      IDを指定して項目を修正
-  /log_rm      IDを指定して削除
+  /log_rm      IDを複数指定して削除
   /log_wari    割り勘の精算計算
 """
 import asyncio
@@ -645,15 +645,35 @@ async def log_ed(interaction: discord.Interaction, id: int, field: app_commands.
         await interaction.followup.send(f"ID {id} が見つかりませんでした。", ephemeral=True)
 
 
-@bot.tree.command(name="log_rm", description="IDを指定して記録を削除します")
-@app_commands.describe(id="削除したい記録のID")
-async def log_rm(interaction: discord.Interaction, id: int):
+@bot.tree.command(name="log_rm", description="IDを複数指定して記録を削除します")
+@app_commands.describe(ids="削除するID（例: 23,24,25 または 23 24 25）")
+async def log_rm(interaction: discord.Interaction, ids: str):
+    tokens = [value for value in re.split(r"[\s,、]+", ids.strip()) if value]
+    if not tokens or any(not value.isdigit() for value in tokens):
+        await interaction.response.send_message(
+            "IDは数字をカンマまたは空白で区切ってください（例: `23,24,25`）。",
+            ephemeral=True,
+        )
+        return
+
+    # 入力順を保ったまま重複を除く
+    entry_ids = list(dict.fromkeys(int(value) for value in tokens))
     await interaction.response.defer()
-    ok = await run_sync(get_store().delete_entry, id)
-    if ok:
-        await interaction.followup.send(f"🗑️ ID {id} を削除しました。")
-    else:
-        await interaction.followup.send(f"ID {id} が見つかりませんでした。", ephemeral=True)
+    st = get_store()
+    deleted = []
+    missing = []
+    for entry_id in entry_ids:
+        if await run_sync(st.delete_entry, entry_id):
+            deleted.append(str(entry_id))
+        else:
+            missing.append(str(entry_id))
+
+    messages = []
+    if deleted:
+        messages.append(f"🗑️ ID {', '.join(deleted)} を削除しました。")
+    if missing:
+        messages.append(f"⚠️ ID {', '.join(missing)} は見つかりませんでした。")
+    await interaction.followup.send("\n".join(messages), ephemeral=not deleted)
 
 
 @bot.tree.command(name="log_wari", description="割り勘の精算額を計算します")
