@@ -2,16 +2,20 @@
 TabiLog Bot - 世界一周の費用ログ用Discord Bot
 
 コマンド一覧:
-  /log_ex   支出を記録（モーダル入力、割り勘ON時は参加者選択が続く）
-  /log_in   収入を記録（モーダル入力）
-  /log_ct   このチャンネルを国に紐付け
-  /log_sum  国・タグで絞り込み集計
-  /log_all  全体サマリー
-  /log_ls   ID付き一覧表示
-  /log_ed   IDを指定して項目を修正
-  /log_rm   IDを指定して削除
-  /log_wari 割り勘の精算計算
+  /log_ex      支出を記録（金額入力→タグ/割り勘を1画面で選択）
+  /log_in      収入を記録（金額入力→タグを1画面で選択）
+  /log_ct      このチャンネルを国に紐付け
+  /log_tag_add タグを登録
+  /log_tag_rm  タグを削除
+  /log_tag_ls  登録タグ一覧
+  /log_sum     国・タグで絞り込み集計
+  /log_all     全体サマリー
+  /log_ls      ID付き一覧表示
+  /log_ed      IDを指定して項目を修正
+  /log_rm      IDを指定して削除
+  /log_wari    割り勘の精算計算
 """
+import asyncio
 import os
 import re
 import logging
@@ -48,6 +52,11 @@ def get_store() -> SheetStore:
     return store
 
 
+async def run_sync(func, *args, **kwargs):
+    """同期のSheets/HTTP呼び出しをスレッドに逃がし、イベントループを塞がない。"""
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
 def _valid_discord_id(value) -> str | None:
     """保存値が正しいDiscordユーザーIDなら返す。壊れた数値は除外する。"""
     cleaned = str(value).strip().lstrip("'")
@@ -59,8 +68,39 @@ def _participant_ids(entry: dict) -> list[str]:
     return [uid for value in values if (uid := _valid_discord_id(value))]
 
 
+def _entry_embed(
+    entry_id: int,
+    entry_type: str,
+    country: str,
+    amount_local: float,
+    currency: str,
+    amount_jpy: float,
+    tags: str,
+    memo: str,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"✅ 記録しました (ID: {entry_id})",
+        color=discord.Color.green() if entry_type == "収入" else discord.Color.orange(),
+    )
+    embed.add_field(name="種別", value=entry_type, inline=True)
+    embed.add_field(name="国", value=country, inline=True)
+    if currency != "JPY":
+        embed.add_field(
+            name="金額", value=f"{amount_local:,.0f} {currency} → 約{amount_jpy:,.0f}円", inline=False
+        )
+    else:
+        embed.add_field(name="金額", value=f"{amount_jpy:,.0f}円", inline=False)
+    if tags:
+        embed.add_field(name="タグ", value=tags, inline=True)
+    if memo:
+        embed.add_field(name="メモ", value=memo, inline=False)
+    if country == DEFAULT_COUNTRY:
+        embed.set_footer(text="国が未設定のチャンネルです。/log_ed で後から修正できます。")
+    return embed
+
+
 # ---------------------------------------------------------------------------
-# 支出/収入 記録用モーダル
+# 支出/収入 記録用モーダル → オプションを1画面でまとめて選択
 # ---------------------------------------------------------------------------
 
 class EntryModal(discord.ui.Modal):
@@ -77,28 +117,13 @@ class EntryModal(discord.ui.Modal):
             required=False,
             max_length=10,
         )
-        self.tags = discord.ui.TextInput(
-            label="タグ（カンマ区切りで複数可）",
-            placeholder="例: 飯,屋台",
-            required=False,
-            max_length=100,
-        )
         self.memo = discord.ui.TextInput(
             label="メモ", required=False, max_length=200
         )
 
         self.add_item(self.amount)
         self.add_item(self.currency)
-        self.add_item(self.tags)
         self.add_item(self.memo)
-
-        if entry_type == "支出":
-            self.split = discord.ui.TextInput(
-                label="割り勘（on / off）", placeholder="off", required=False, max_length=5
-            )
-            self.add_item(self.split)
-        else:
-            self.split = None
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -111,94 +136,211 @@ class EntryModal(discord.ui.Modal):
             return
 
         currency = (self.currency.value or "JPY").strip().upper()
-        tags = self.tags.value.strip()
         memo = self.memo.value.strip()
-        split_on = bool(self.split and self.split.value.strip().lower() == "on")
+
+        # Sheets/為替は数秒かかるので先に応答を確保する
+        await interaction.response.defer()
 
         st = get_store()
         channel_id = interaction.channel_id
-        country = st.get_country_for_channel(channel_id) or DEFAULT_COUNTRY
 
         try:
-            amount_jpy, rate = fx.convert_to_jpy(amount_local, currency)
+            country = await run_sync(st.get_country_for_channel, channel_id) or DEFAULT_COUNTRY
+            amount_jpy, rate = await run_sync(fx.convert_to_jpy, amount_local, currency)
         except Exception as e:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"為替レートの取得に失敗しました: {e}\n通貨コードを確認してください。",
                 ephemeral=True,
             )
             return
 
-        entry_id = st.add_entry(
-            entry_type=self.entry_type,
-            channel_id=channel_id,
-            country=country,
-            amount_local=amount_local,
-            currency=currency,
-            rate=rate,
-            amount_jpy=amount_jpy,
-            tags=tags,
-            memo=memo,
-            split=split_on,
-            payer_id=str(interaction.user.id) if split_on else "",
-            participants="",
-        )
+        try:
+            # タグ・割り勘は次の1画面で選ぶので、いったん空/OFFで保存する
+            entry_id = await run_sync(
+                st.add_entry,
+                entry_type=self.entry_type,
+                channel_id=channel_id,
+                country=country,
+                amount_local=amount_local,
+                currency=currency,
+                rate=rate,
+                amount_jpy=amount_jpy,
+                tags="",
+                memo=memo,
+                split=False,
+                payer_id="",
+                participants="",
+            )
+            tags = await run_sync(st.list_tags)
+        except Exception as e:
+            log.exception("entry submit failed")
+            await interaction.followup.send(
+                f"記録に失敗しました: {e}\n少し待ってからもう一度送信してください。",
+                ephemeral=True,
+            )
+            return
 
-        embed = discord.Embed(
-            title=f"✅ 記録しました (ID: {entry_id})",
-            color=discord.Color.green() if self.entry_type == "収入" else discord.Color.orange(),
+        embed = _entry_embed(
+            entry_id, self.entry_type, country, amount_local, currency, amount_jpy, "", memo
         )
-        embed.add_field(name="種別", value=self.entry_type, inline=True)
-        embed.add_field(name="国", value=country, inline=True)
-        if currency != "JPY":
-            embed.add_field(
-                name="金額", value=f"{amount_local:,.0f} {currency} → 約{amount_jpy:,.0f}円", inline=False
+        await interaction.followup.send(embed=embed)
+
+        if self.entry_type == "支出":
+            guide = (
+                f"ID {entry_id}: 下でまとめて選んでから確定してください。\n"
+                "・タグ（任意）\n"
+                "・割り勘あり → 支払者と参加者も選んで「割り勘ありで確定」\n"
+                "・割り勘なし → 「割り勘なしで確定」だけ押す"
             )
         else:
-            embed.add_field(name="金額", value=f"{amount_jpy:,.0f}円", inline=False)
-        if tags:
-            embed.add_field(name="タグ", value=tags, inline=True)
-        if memo:
-            embed.add_field(name="メモ", value=memo, inline=False)
-        if country == DEFAULT_COUNTRY:
-            embed.set_footer(text="国が未設定のチャンネルです。/log_ed で後から修正できます。")
+            guide = f"ID {entry_id}: タグを選んで「確定」を押してください（タグなしでもOK）。"
 
-        await interaction.response.send_message(embed=embed)
-
-        if split_on:
-            view = ParticipantSelectView(entry_id=entry_id, payer_id=interaction.user.id)
-            await interaction.followup.send(
-                "割り勘の参加者を選んでください（支払者は自動的に含まれます）:",
-                view=view,
-            )
-
-
-class ParticipantSelectView(discord.ui.View):
-    def __init__(self, entry_id: int, payer_id: int):
-        super().__init__(timeout=180)
-        self.entry_id = entry_id
-        self.payer_id = payer_id
-
-        select = discord.ui.UserSelect(
-            placeholder="参加者を選択（複数選択可）", min_values=1, max_values=10
+        await interaction.followup.send(
+            content=guide,
+            view=EntryOptionsView(entry_id=entry_id, entry_type=self.entry_type, tags=tags),
         )
-        select.callback = self.on_select
-        self.add_item(select)
 
-    async def on_select(self, interaction: discord.Interaction):
-        chosen_ids = set()
+
+class EntryOptionsView(discord.ui.View):
+    """タグ・支払者・参加者を1メッセージ内で選び、ボタンで確定する。"""
+
+    def __init__(self, entry_id: int, entry_type: str, tags: list[str]):
+        super().__init__(timeout=300)
+        self.entry_id = entry_id
+        self.entry_type = entry_type
+        self.selected_tags: list[str] = []
+        self.payer_id: str | None = None
+        self.participant_ids: set[str] = set()
+
+        if tags:
+            options = [
+                discord.SelectOption(label=tag[:100], value=tag[:100])
+                for tag in tags[:25]
+            ]
+            tag_select = discord.ui.Select(
+                custom_id="entry_tags",
+                placeholder="タグ（任意・複数可）",
+                min_values=0,
+                max_values=min(len(options), 25),
+                options=options,
+            )
+            tag_select.callback = self.on_tags
+            self.add_item(tag_select)
+
+        if entry_type == "支出":
+            payer_select = discord.ui.UserSelect(
+                custom_id="entry_payer",
+                placeholder="支払者（割り勘時は必須）",
+                min_values=0,
+                max_values=1,
+            )
+            payer_select.callback = self.on_payer
+            self.add_item(payer_select)
+
+            participants_select = discord.ui.UserSelect(
+                custom_id="entry_participants",
+                placeholder="参加者（割り勘時・複数可）",
+                min_values=0,
+                max_values=10,
+            )
+            participants_select.callback = self.on_participants
+            self.add_item(participants_select)
+
+            btn_split = discord.ui.Button(
+                label="割り勘ありで確定",
+                style=discord.ButtonStyle.primary,
+                custom_id="confirm_split",
+            )
+            btn_split.callback = self.confirm_split
+            self.add_item(btn_split)
+
+            btn_plain = discord.ui.Button(
+                label="割り勘なしで確定",
+                style=discord.ButtonStyle.secondary,
+                custom_id="confirm_plain",
+            )
+            btn_plain.callback = self.confirm_plain
+            self.add_item(btn_plain)
+        else:
+            btn_ok = discord.ui.Button(
+                label="確定",
+                style=discord.ButtonStyle.primary,
+                custom_id="confirm_income",
+            )
+            btn_ok.callback = self.confirm_plain
+            self.add_item(btn_ok)
+
+    async def on_tags(self, interaction: discord.Interaction):
         for item in self.children:
-            if isinstance(item, discord.ui.UserSelect):
-                chosen_ids = {str(u.id) for u in item.values}
+            if isinstance(item, discord.ui.Select) and item.custom_id == "entry_tags":
+                self.selected_tags = list(item.values)
+        await interaction.response.defer()
 
-        chosen_ids.add(str(self.payer_id))  # 支払者は必ず含める
-        participants_str = ",".join(sorted(chosen_ids))
+    async def on_payer(self, interaction: discord.Interaction):
+        for item in self.children:
+            if isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_payer":
+                self.payer_id = str(item.values[0].id) if item.values else None
+        await interaction.response.defer()
 
+    async def on_participants(self, interaction: discord.Interaction):
+        for item in self.children:
+            if isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_participants":
+                self.participant_ids = {str(u.id) for u in item.values}
+        await interaction.response.defer()
+
+    def _tags_str(self) -> str:
+        return ",".join(self.selected_tags)
+
+    async def confirm_plain(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         st = get_store()
-        st.update_split_participants(self.entry_id, participants_str)
+        tags = self._tags_str()
+        await run_sync(st.update_field, self.entry_id, "タグ", tags)
+        await run_sync(st.update_field, self.entry_id, "割り勘", "OFF")
+        await run_sync(st.update_field, self.entry_id, "支払者ID", "")
+        await run_sync(st.update_split_participants, self.entry_id, "")
 
-        names = ", ".join(f"<@{uid}>" for uid in chosen_ids)
-        await interaction.response.edit_message(
-            content=f"✅ ID {self.entry_id} の割り勘参加者を設定しました: {names}",
+        note = f"（タグ: {tags}）" if tags else "（タグなし）"
+        await interaction.edit_original_response(
+            content=f"✅ ID {self.entry_id} の記録が完了しました{note}",
+            view=None,
+        )
+
+    async def confirm_split(self, interaction: discord.Interaction):
+        if not self.payer_id:
+            await interaction.response.send_message(
+                "割り勘ありの場合は、先に「支払者」を選んでから確定してください。",
+                ephemeral=True,
+            )
+            return
+
+        participants = set(self.participant_ids)
+        participants.add(self.payer_id)
+        if len(participants) < 2:
+            await interaction.response.send_message(
+                "割り勘ありの場合は、支払者以外の参加者も1人以上選んでください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        st = get_store()
+        tags = self._tags_str()
+        participants_str = ",".join(sorted(participants))
+        await run_sync(st.update_field, self.entry_id, "タグ", tags)
+        await run_sync(st.update_field, self.entry_id, "割り勘", "ON")
+        await run_sync(st.update_field, self.entry_id, "支払者ID", self.payer_id)
+        await run_sync(st.update_split_participants, self.entry_id, participants_str)
+
+        names = ", ".join(f"<@{uid}>" for uid in sorted(participants))
+        tag_note = f"タグ: {tags}\n" if tags else ""
+        await interaction.edit_original_response(
+            content=(
+                f"✅ ID {self.entry_id} の割り勘記録が完了しました\n"
+                f"{tag_note}"
+                f"支払者: <@{self.payer_id}>\n"
+                f"参加者: {names}"
+            ),
             view=None,
         )
 
@@ -210,8 +352,15 @@ class ParticipantSelectView(discord.ui.View):
 @bot.event
 async def on_ready():
     try:
+        await run_sync(get_store)  # Sheets接続を事前に温めておく
+        # グローバル同期は反映まで最大約1時間かかることがあるため、
+        # 参加中サーバーへも即時同期する
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            log.info(f"synced {len(synced)} commands to guild {guild.name} ({guild.id})")
         synced = await bot.tree.sync()
-        log.info(f"synced {len(synced)} commands")
+        log.info(f"synced {len(synced)} global commands")
     except Exception as e:
         log.exception(e)
     log.info(f"Logged in as {bot.user}")
@@ -230,11 +379,49 @@ async def log_in(interaction: discord.Interaction):
 @bot.tree.command(name="log_ct", description="このチャンネルを国/地域に紐付けます")
 @app_commands.describe(country="紐付ける国/地域名（例: タイ）")
 async def log_ct(interaction: discord.Interaction, country: str):
-    st = get_store()
-    st.bind_channel_country(interaction.channel_id, country)
-    await interaction.response.send_message(
+    await interaction.response.defer()
+    await run_sync(get_store().bind_channel_country, interaction.channel_id, country)
+    await interaction.followup.send(
         f"✅ このチャンネルを「{country}」に固定しました。以後 /log_ex や /log_in で国は自動設定されます。"
     )
+
+
+@bot.tree.command(name="log_tag_add", description="記録用タグを登録します")
+@app_commands.describe(tag="登録するタグ名（例: 飯）")
+async def log_tag_add(interaction: discord.Interaction, tag: str):
+    await interaction.response.defer()
+    ok = await run_sync(get_store().add_tag, tag)
+    if ok:
+        await interaction.followup.send(f"✅ タグ「{tag.strip()}」を登録しました。")
+    else:
+        await interaction.followup.send(
+            f"タグ「{tag.strip()}」は既に登録済みか、空です。", ephemeral=True
+        )
+
+
+@bot.tree.command(name="log_tag_rm", description="登録済みタグを削除します")
+@app_commands.describe(tag="削除するタグ名")
+async def log_tag_rm(interaction: discord.Interaction, tag: str):
+    await interaction.response.defer()
+    ok = await run_sync(get_store().remove_tag, tag)
+    if ok:
+        await interaction.followup.send(f"🗑️ タグ「{tag.strip()}」を削除しました。")
+    else:
+        await interaction.followup.send(
+            f"タグ「{tag.strip()}」は見つかりませんでした。", ephemeral=True
+        )
+
+
+@bot.tree.command(name="log_tag_ls", description="登録済みタグ一覧を表示します")
+async def log_tag_ls(interaction: discord.Interaction):
+    await interaction.response.defer()
+    tags = await run_sync(get_store().list_tags)
+    if not tags:
+        await interaction.followup.send(
+            "登録タグがありません。`/log_tag_add` で追加してください。"
+        )
+        return
+    await interaction.followup.send("🏷 登録タグ: " + ", ".join(f"`{t}`" for t in tags))
 
 
 def _split_summary(entry: dict) -> str:
@@ -265,12 +452,12 @@ def _match_entry(entry: dict, country: str | None, tag: str | None) -> bool:
 @bot.tree.command(name="log_sum", description="国・タグで絞り込んで集計します")
 @app_commands.describe(country="絞り込む国（省略可）", tag="絞り込むタグ（省略可）")
 async def log_sum(interaction: discord.Interaction, country: str | None = None, tag: str | None = None):
-    st = get_store()
-    entries = st.get_all_entries()
+    await interaction.response.defer()
+    entries = await run_sync(get_store().get_all_entries)
     filtered = [e for e in entries if _match_entry(e, country, tag)]
 
     if not filtered:
-        await interaction.response.send_message("該当する記録がありませんでした。")
+        await interaction.followup.send("該当する記録がありませんでした。")
         return
 
     total_expense = sum(e["円換算額"] for e in filtered if e["種別"] == "支出")
@@ -299,15 +486,15 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
     if lines:
         embed.add_field(name="直近の記録", value="\n".join(lines), inline=False)
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="log_all", description="全体サマリー（国別内訳つき）")
 async def log_all(interaction: discord.Interaction):
-    st = get_store()
-    entries = st.get_all_entries()
+    await interaction.response.defer()
+    entries = await run_sync(get_store().get_all_entries)
     if not entries:
-        await interaction.response.send_message("記録がまだありません。")
+        await interaction.followup.send("記録がまだありません。")
         return
 
     total_expense = sum(e["円換算額"] for e in entries if e["種別"] == "支出")
@@ -327,19 +514,19 @@ async def log_all(interaction: discord.Interaction):
     if country_lines:
         embed.add_field(name="国別支出", value="\n".join(country_lines), inline=False)
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="log_ls", description="ID付きで記録を一覧表示します（直近20件）")
 @app_commands.describe(country="絞り込む国（省略可）")
 async def log_ls(interaction: discord.Interaction, country: str | None = None):
-    st = get_store()
-    entries = st.get_all_entries()
+    await interaction.response.defer()
+    entries = await run_sync(get_store().get_all_entries)
     filtered = [e for e in entries if _match_entry(e, country, None)]
     filtered = filtered[-20:]
 
     if not filtered:
-        await interaction.response.send_message("該当する記録がありませんでした。")
+        await interaction.followup.send("該当する記録がありませんでした。")
         return
 
     lines = []
@@ -359,7 +546,7 @@ async def log_ls(interaction: discord.Interaction, country: str | None = None):
         text = text[-4000:]
 
     embed = discord.Embed(title="📋 記録一覧", description=text, color=discord.Color.blue())
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 FIELD_CHOICES = [
@@ -386,11 +573,12 @@ def _parse_mentions(value: str) -> list[str]:
 )
 @app_commands.choices(field=FIELD_CHOICES)
 async def log_ed(interaction: discord.Interaction, id: int, field: app_commands.Choice[str], value: str):
+    await interaction.response.defer()
     st = get_store()
-    entries = st.get_all_entries()
+    entries = await run_sync(st.get_all_entries)
     target = next((e for e in entries if str(e["ID"]) == str(id)), None)
     if target is None:
-        await interaction.response.send_message(f"ID {id} が見つかりませんでした。", ephemeral=True)
+        await interaction.followup.send(f"ID {id} が見つかりませんでした。", ephemeral=True)
         return
 
     # 金額 or 通貨を変更した場合は円換算額とレートも再計算する
@@ -399,17 +587,17 @@ async def log_ed(interaction: discord.Interaction, id: int, field: app_commands.
         currency = value.upper() if field.value == "通貨" else target["通貨"]
 
         try:
-            amount_jpy, rate = fx.convert_to_jpy(amount_local, currency)
+            amount_jpy, rate = await run_sync(fx.convert_to_jpy, amount_local, currency)
         except Exception as e:
-            await interaction.response.send_message(f"為替レート取得に失敗しました: {e}", ephemeral=True)
+            await interaction.followup.send(f"為替レート取得に失敗しました: {e}", ephemeral=True)
             return
 
-        st.update_field(id, "現地金額", str(amount_local))
-        st.update_field(id, "通貨", currency)
-        st.update_field(id, "レート", str(rate))
-        st.update_field(id, "円換算額", str(amount_jpy))
+        await run_sync(st.update_field, id, "現地金額", str(amount_local))
+        await run_sync(st.update_field, id, "通貨", currency)
+        await run_sync(st.update_field, id, "レート", str(rate))
+        await run_sync(st.update_field, id, "円換算額", str(amount_jpy))
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ ID {id} を更新しました: {amount_local} {currency} → {amount_jpy:,.0f}円"
         )
         return
@@ -417,27 +605,27 @@ async def log_ed(interaction: discord.Interaction, id: int, field: app_commands.
     if field.value == "割り勘":
         normalized = value.strip().upper()
         if normalized not in ("ON", "OFF"):
-            await interaction.response.send_message("割り勘の値は ON か OFF で指定してください。", ephemeral=True)
+            await interaction.followup.send("割り勘の値は ON か OFF で指定してください。", ephemeral=True)
             return
-        st.update_field(id, "割り勘", normalized)
-        await interaction.response.send_message(f"✅ ID {id} の割り勘を {normalized} にしました。")
+        await run_sync(st.update_field, id, "割り勘", normalized)
+        await interaction.followup.send(f"✅ ID {id} の割り勘を {normalized} にしました。")
         return
 
     if field.value == "支払者ID":
         ids = _parse_mentions(value)
         if not ids:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "支払者は @ユーザー名 の形式で1人だけメンションしてください。", ephemeral=True
             )
             return
-        st.update_field(id, "支払者ID", ids[0])
-        await interaction.response.send_message(f"✅ ID {id} の支払者を <@{ids[0]}> にしました。")
+        await run_sync(st.update_field, id, "支払者ID", ids[0])
+        await interaction.followup.send(f"✅ ID {id} の支払者を <@{ids[0]}> にしました。")
         return
 
     if field.value == "参加者ID":
         ids = _parse_mentions(value)
         if not ids:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "参加者は @ユーザー名 の形式でメンションしてください（複数可）。", ephemeral=True
             )
             return
@@ -445,34 +633,34 @@ async def log_ed(interaction: discord.Interaction, id: int, field: app_commands.
         if payer:
             ids.append(payer)
         ids = sorted(set(ids))
-        st.update_field(id, "参加者ID", ",".join(ids))
+        await run_sync(st.update_field, id, "参加者ID", ",".join(ids))
         names = ", ".join(f"<@{uid}>" for uid in ids)
-        await interaction.response.send_message(f"✅ ID {id} の参加者を更新しました: {names}")
+        await interaction.followup.send(f"✅ ID {id} の参加者を更新しました: {names}")
         return
 
-    ok = st.update_field(id, field.value, value)
+    ok = await run_sync(st.update_field, id, field.value, value)
     if ok:
-        await interaction.response.send_message(f"✅ ID {id} の「{field.value}」を更新しました: {value}")
+        await interaction.followup.send(f"✅ ID {id} の「{field.value}」を更新しました: {value}")
     else:
-        await interaction.response.send_message(f"ID {id} が見つかりませんでした。", ephemeral=True)
+        await interaction.followup.send(f"ID {id} が見つかりませんでした。", ephemeral=True)
 
 
 @bot.tree.command(name="log_rm", description="IDを指定して記録を削除します")
 @app_commands.describe(id="削除したい記録のID")
 async def log_rm(interaction: discord.Interaction, id: int):
-    st = get_store()
-    ok = st.delete_entry(id)
+    await interaction.response.defer()
+    ok = await run_sync(get_store().delete_entry, id)
     if ok:
-        await interaction.response.send_message(f"🗑️ ID {id} を削除しました。")
+        await interaction.followup.send(f"🗑️ ID {id} を削除しました。")
     else:
-        await interaction.response.send_message(f"ID {id} が見つかりませんでした。", ephemeral=True)
+        await interaction.followup.send(f"ID {id} が見つかりませんでした。", ephemeral=True)
 
 
 @bot.tree.command(name="log_wari", description="割り勘の精算額を計算します")
 @app_commands.describe(country="絞り込む国（省略可）")
 async def log_wari(interaction: discord.Interaction, country: str | None = None):
-    st = get_store()
-    entries = st.get_all_entries()
+    await interaction.response.defer()
+    entries = await run_sync(get_store().get_all_entries)
 
     split_entries = [
         e for e in entries
@@ -480,7 +668,7 @@ async def log_wari(interaction: discord.Interaction, country: str | None = None)
     ]
 
     if not split_entries:
-        await interaction.response.send_message("割り勘対象の記録がありませんでした。")
+        await interaction.followup.send("割り勘対象の記録がありませんでした。")
         return
 
     balance = defaultdict(float)  # user_id -> balance (プラス=貰える, マイナス=払う)
@@ -524,13 +712,13 @@ async def log_wari(interaction: discord.Interaction, country: str | None = None)
     if not transactions:
         if invalid_entry_ids:
             ids = ", ".join(invalid_entry_ids)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"⚠️ ID {ids} の参加者データが破損しています。"
                 " `/log_ed` で参加者をメンション指定し直してください。",
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message("精算の必要はありません（すでに帳尻が合っています）。")
+        await interaction.followup.send("精算の必要はありません（すでに帳尻が合っています）。")
         return
 
     lines = [f"<@{a}> → <@{b}> に {amt:,.0f}円" for a, b, amt in transactions]
@@ -540,7 +728,7 @@ async def log_wari(interaction: discord.Interaction, country: str | None = None)
         embed.set_footer(
             text=f"参加者データ破損のため除外: ID {', '.join(invalid_entry_ids)}"
         )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 if __name__ == "__main__":

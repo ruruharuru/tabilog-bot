@@ -3,6 +3,7 @@ Google Sheets 操作モジュール
 2つのタブを使う:
   - "Log"      : 収支の記録本体
   - "Channels" : チャンネルID <-> 国 の紐付け
+  - "Tags"     : 選択用タグ一覧
 存在しない場合は自動で作成する。
 
 【重要】DiscordのIDは18〜19桁なので、Sheetsには必ずRAW文字列として書き込む。
@@ -27,6 +28,7 @@ LOG_HEADERS = [
     "タグ", "メモ", "割り勘", "支払者ID", "参加者ID",
 ]
 CHANNEL_HEADERS = ["チャンネルID", "国"]
+TAG_HEADERS = ["タグ"]
 
 ID_LIKE_FIELDS = {"チャンネルID", "支払者ID", "参加者ID"}
 
@@ -55,6 +57,8 @@ class SheetStore:
         self.ss = self.client.open_by_key(sheet_id)
         self.log_ws = self._get_or_create_ws("Log", LOG_HEADERS)
         self.channel_ws = self._get_or_create_ws("Channels", CHANNEL_HEADERS)
+        self.tag_ws = self._get_or_create_ws("Tags", TAG_HEADERS)
+        self._ensure_default_tags()
 
     def _get_or_create_ws(self, title, headers):
         try:
@@ -68,6 +72,14 @@ class SheetStore:
         if not first_row:
             ws.append_row(headers, value_input_option="RAW")
         return ws
+
+    def _ensure_default_tags(self):
+        """Tagsシートが空ならよく使うタグを初期投入する。"""
+        if self.list_tags():
+            return
+        defaults = ["飯", "移動", "宿", "観光", "買い物", "その他"]
+        rows = [[t] for t in defaults]
+        self.tag_ws.append_rows(rows, value_input_option="RAW")
 
     # ---------- Channel <-> Country ----------
 
@@ -170,3 +182,35 @@ class SheetStore:
             return False
         self.log_ws.delete_rows(row_idx)
         return True
+
+    # ---------- Tags ----------
+
+    def list_tags(self) -> list[str]:
+        values = self.tag_ws.col_values(1)[1:]  # ヘッダー除く
+        tags = []
+        seen = set()
+        for v in values:
+            tag = str(v).strip()
+            if tag and tag not in seen:
+                seen.add(tag)
+                tags.append(tag)
+        return tags
+
+    def add_tag(self, tag: str) -> bool:
+        tag = tag.strip()
+        if not tag:
+            return False
+        existing = {t.lower() for t in self.list_tags()}
+        if tag.lower() in existing:
+            return False
+        self.tag_ws.append_row([tag], value_input_option="RAW")
+        return True
+
+    def remove_tag(self, tag: str) -> bool:
+        tag = tag.strip().lower()
+        values = self.tag_ws.col_values(1)[1:]
+        for i, v in enumerate(values, start=2):
+            if str(v).strip().lower() == tag:
+                self.tag_ws.delete_rows(i)
+                return True
+        return False
