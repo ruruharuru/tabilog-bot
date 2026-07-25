@@ -11,11 +11,12 @@ TabiLog Bot - 世界一周の費用ログ用Discord Bot
   /log_sum     国・タグで絞り込み集計
   /log_all     全体サマリー
   /log_ls      ID付き一覧表示
-  /log_ed      IDを指定して項目を修正
+  /log_ed      IDを指定して記録を確認・修正
   /log_rm      IDを複数指定して削除
   /log_wari    割り勘の精算計算
 """
 import asyncio
+import datetime
 import os
 import re
 import logging
@@ -549,100 +550,376 @@ async def log_ls(interaction: discord.Interaction, country: str | None = None):
     await interaction.followup.send(embed=embed)
 
 
-FIELD_CHOICES = [
-    app_commands.Choice(name="現地金額", value="現地金額"),
-    app_commands.Choice(name="通貨", value="通貨"),
-    app_commands.Choice(name="タグ", value="タグ"),
-    app_commands.Choice(name="メモ", value="メモ"),
-    app_commands.Choice(name="国", value="国"),
-    app_commands.Choice(name="割り勘ON/OFF", value="割り勘"),
-    app_commands.Choice(name="支払者", value="支払者ID"),
-    app_commands.Choice(name="参加者", value="参加者ID"),
+EDIT_FIELDS = [
+    ("日時", "日時"),
+    ("現地金額", "現地金額"),
+    ("通貨", "通貨"),
+    ("タグ", "タグ"),
+    ("メモ", "メモ"),
+    ("国", "国"),
+    ("割り勘ON/OFF", "割り勘"),
+    ("支払者", "支払者ID"),
+    ("参加者", "参加者ID"),
 ]
+
+DATETIME_FORMATS = (
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y/%m/%d %H:%M:%S",
+)
+
 
 def _parse_mentions(value: str) -> list[str]:
     """'@user1 @user2' のようなメンション文字列からユーザーIDのリストを取り出す"""
     return MENTION_RE.findall(value)
 
 
-@bot.tree.command(name="log_ed", description="IDを指定して記録を修正します")
-@app_commands.describe(
-    id="修正したい記録のID",
-    field="修正する項目",
-    value="新しい値（支払者/参加者はDiscordのメンション @ユーザー名 で指定してください）",
-)
-@app_commands.choices(field=FIELD_CHOICES)
-async def log_ed(interaction: discord.Interaction, id: int, field: app_commands.Choice[str], value: str):
-    await interaction.response.defer()
+def _parse_datetime(value: str) -> str | None:
+    """入力日時を 'YYYY-MM-DD HH:MM' に正規化する。失敗時は None。"""
+    text = value.strip()
+    for fmt in DATETIME_FORMATS:
+        try:
+            return datetime.datetime.strptime(text, fmt).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+    return None
+
+
+def _mention_or_raw(user_id: str) -> str:
+    uid = _valid_discord_id(user_id)
+    return f"<@{uid}>" if uid else (user_id or "（未設定）")
+
+
+def _entry_detail_embed(entry: dict) -> discord.Embed:
+    """編集前に現状を見せる用の詳細Embed。"""
+    entry_id = entry.get("ID")
+    entry_type = entry.get("種別", "")
+    embed = discord.Embed(
+        title=f"✏️ 記録の編集 (ID: {entry_id})",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="種別", value=entry_type or "-", inline=True)
+    embed.add_field(name="日時", value=str(entry.get("日時") or "-"), inline=True)
+    embed.add_field(name="国", value=str(entry.get("国") or "-"), inline=True)
+
+    currency = str(entry.get("通貨") or "JPY")
+    amount_local = entry.get("現地金額", "")
+    amount_jpy = entry.get("円換算額", "")
+    if currency != "JPY":
+        amount_text = f"{amount_local} {currency} → {amount_jpy}円"
+    else:
+        amount_text = f"{amount_jpy}円"
+    embed.add_field(name="金額", value=amount_text, inline=False)
+    embed.add_field(name="タグ", value=str(entry.get("タグ") or "（なし）"), inline=True)
+    embed.add_field(name="メモ", value=str(entry.get("メモ") or "（なし）"), inline=True)
+    embed.add_field(name="割り勘", value=str(entry.get("割り勘") or "OFF"), inline=True)
+
+    participants = _participant_ids(entry)
+    embed.add_field(
+        name="支払者",
+        value=_mention_or_raw(str(entry.get("支払者ID", ""))),
+        inline=True,
+    )
+    if participants:
+        embed.add_field(
+            name="参加者",
+            value=" ".join(f"<@{p}>" for p in participants),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="参加者", value="（未設定）", inline=False)
+
+    embed.set_footer(text="下のメニューから修正する項目を選んでください")
+    return embed
+
+
+async def _apply_field_update(
+    interaction: discord.Interaction,
+    entry_id: int,
+    field: str,
+    value: str,
+    target: dict,
+) -> bool:
+    """
+    項目更新を行い、成功時は True。失敗時は ephemeral で理由を返して False。
+    interaction はすでに defer 済みでも、未応答でもよい（内部で分岐）。
+    """
     st = get_store()
-    entries = await run_sync(st.get_all_entries)
+
+    async def reply(msg: str, *, ephemeral: bool = False):
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(msg, ephemeral=ephemeral)
+
+    if field == "日時":
+        normalized = _parse_datetime(value)
+        if not normalized:
+            await reply(
+                "日時は `YYYY-MM-DD HH:MM` 形式で指定してください（例: `2026-07-25 18:30`）。",
+                ephemeral=True,
+            )
+            return False
+        await run_sync(st.update_field, entry_id, "日時", normalized)
+        await reply(f"✅ ID {entry_id} の日時を {normalized} に更新しました。")
+        return True
+
+    if field in ("現地金額", "通貨"):
+        try:
+            amount_local = float(value) if field == "現地金額" else float(target["現地金額"])
+        except ValueError:
+            await reply("金額は数字で入力してください。", ephemeral=True)
+            return False
+        currency = value.upper() if field == "通貨" else str(target["通貨"])
+        try:
+            amount_jpy, rate = await run_sync(fx.convert_to_jpy, amount_local, currency)
+        except Exception as e:
+            await reply(f"為替レート取得に失敗しました: {e}", ephemeral=True)
+            return False
+        await run_sync(st.update_field, entry_id, "現地金額", str(amount_local))
+        await run_sync(st.update_field, entry_id, "通貨", currency)
+        await run_sync(st.update_field, entry_id, "レート", str(rate))
+        await run_sync(st.update_field, entry_id, "円換算額", str(amount_jpy))
+        await reply(f"✅ ID {entry_id} を更新しました: {amount_local} {currency} → {amount_jpy:,.0f}円")
+        return True
+
+    if field == "割り勘":
+        normalized = value.strip().upper()
+        if normalized not in ("ON", "OFF"):
+            await reply("割り勘の値は ON か OFF で指定してください。", ephemeral=True)
+            return False
+        await run_sync(st.update_field, entry_id, "割り勘", normalized)
+        await reply(f"✅ ID {entry_id} の割り勘を {normalized} にしました。")
+        return True
+
+    if field == "支払者ID":
+        ids = _parse_mentions(value) or ([value] if _valid_discord_id(value) else [])
+        if not ids:
+            await reply("支払者は @ユーザー名 で指定してください。", ephemeral=True)
+            return False
+        await run_sync(st.update_field, entry_id, "支払者ID", ids[0])
+        await reply(f"✅ ID {entry_id} の支払者を <@{ids[0]}> にしました。")
+        return True
+
+    if field == "参加者ID":
+        ids = _parse_mentions(value)
+        if not ids:
+            # カンマ区切りの生IDも許容
+            ids = [p for p in re.split(r"[\s,、]+", value) if _valid_discord_id(p)]
+        if not ids:
+            await reply("参加者は @ユーザー名 で指定してください（複数可）。", ephemeral=True)
+            return False
+        payer = _valid_discord_id(target.get("支払者ID", ""))
+        if payer:
+            ids.append(payer)
+        ids = sorted(set(ids))
+        await run_sync(st.update_field, entry_id, "参加者ID", ",".join(ids))
+        names = ", ".join(f"<@{uid}>" for uid in ids)
+        await reply(f"✅ ID {entry_id} の参加者を更新しました: {names}")
+        return True
+
+    ok = await run_sync(st.update_field, entry_id, field, value)
+    if ok:
+        await reply(f"✅ ID {entry_id} の「{field}」を更新しました: {value}")
+        return True
+    await reply(f"ID {entry_id} が見つかりませんでした。", ephemeral=True)
+    return False
+
+
+class EditValueModal(discord.ui.Modal):
+    def __init__(self, entry_id: int, field: str, current: str, target: dict):
+        labels = {
+            "日時": "日時 (YYYY-MM-DD HH:MM)",
+            "現地金額": "現地金額",
+            "通貨": "通貨コード",
+            "タグ": "タグ（カンマ区切り）",
+            "メモ": "メモ",
+            "国": "国",
+            "支払者ID": "支払者（@メンション）",
+            "参加者ID": "参加者（@メンション 複数可）",
+        }
+        super().__init__(title=f"ID {entry_id}: {labels.get(field, field)} を編集")
+        self.entry_id = entry_id
+        self.field = field
+        self.target = target
+
+        default = str(current or "")
+        if field == "支払者ID" and _valid_discord_id(default):
+            default = f"<@{default}>"
+        elif field == "参加者ID":
+            ids = _participant_ids({"参加者ID": default})
+            default = " ".join(f"<@{uid}>" for uid in ids)
+
+        self.value_input = discord.ui.TextInput(
+            label=labels.get(field, field)[:45],
+            default=default[:400] if default else None,
+            placeholder="新しい値を入力",
+            required=True,
+            max_length=200,
+            style=discord.TextStyle.paragraph if field in ("メモ", "参加者ID", "タグ") else discord.TextStyle.short,
+        )
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        # 最新の支払者情報などが必要な場合に備え、再度読む
+        entries = await run_sync(get_store().get_all_entries)
+        target = next((e for e in entries if str(e["ID"]) == str(self.entry_id)), self.target)
+        await _apply_field_update(
+            interaction, self.entry_id, self.field, self.value_input.value, target
+        )
+
+
+class EditFieldView(discord.ui.View):
+    def __init__(self, entry_id: int, target: dict):
+        super().__init__(timeout=300)
+        self.entry_id = entry_id
+        self.target = target
+
+        select = discord.ui.Select(
+            placeholder="修正する項目を選択",
+            options=[
+                discord.SelectOption(label=label, value=value)
+                for label, value in EDIT_FIELDS
+            ],
+        )
+        select.callback = self.on_field
+        self.add_item(select)
+
+    async def on_field(self, interaction: discord.Interaction):
+        field = None
+        for item in self.children:
+            if isinstance(item, discord.ui.Select):
+                field = item.values[0]
+        if not field:
+            await interaction.response.send_message("項目を選択してください。", ephemeral=True)
+            return
+
+        if field == "割り勘":
+            current = str(self.target.get("割り勘") or "OFF")
+            await interaction.response.edit_message(
+                content=f"ID {self.entry_id}: 割り勘を選んでください（現在: {current}）",
+                view=EditSplitView(self.entry_id, self.target),
+            )
+            return
+
+        if field == "支払者ID":
+            current = _mention_or_raw(str(self.target.get("支払者ID", "")))
+            await interaction.response.edit_message(
+                content=f"ID {self.entry_id}: 支払者を選んでください（現在: {current}）",
+                view=EditPayerView(self.entry_id, self.target),
+            )
+            return
+
+        if field == "参加者ID":
+            participants = _participant_ids(self.target)
+            current = " ".join(f"<@{p}>" for p in participants) if participants else "（未設定）"
+            await interaction.response.edit_message(
+                content=f"ID {self.entry_id}: 参加者を選んでください（現在: {current}）",
+                view=EditParticipantsView(self.entry_id, self.target),
+            )
+            return
+
+        current_map = {
+            "日時": self.target.get("日時", ""),
+            "現地金額": self.target.get("現地金額", ""),
+            "通貨": self.target.get("通貨", ""),
+            "タグ": self.target.get("タグ", ""),
+            "メモ": self.target.get("メモ", ""),
+            "国": self.target.get("国", ""),
+        }
+        await interaction.response.send_modal(
+            EditValueModal(
+                self.entry_id,
+                field,
+                str(current_map.get(field, "")),
+                self.target,
+            )
+        )
+
+
+class EditSplitView(discord.ui.View):
+    def __init__(self, entry_id: int, target: dict):
+        super().__init__(timeout=180)
+        self.entry_id = entry_id
+        self.target = target
+
+    @discord.ui.button(label="ON", style=discord.ButtonStyle.primary)
+    async def set_on(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await _apply_field_update(interaction, self.entry_id, "割り勘", "ON", self.target)
+        await interaction.edit_original_response(view=None)
+
+    @discord.ui.button(label="OFF", style=discord.ButtonStyle.secondary)
+    async def set_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await _apply_field_update(interaction, self.entry_id, "割り勘", "OFF", self.target)
+        await interaction.edit_original_response(view=None)
+
+
+class EditPayerView(discord.ui.View):
+    def __init__(self, entry_id: int, target: dict):
+        super().__init__(timeout=180)
+        self.entry_id = entry_id
+        self.target = target
+        select = discord.ui.UserSelect(placeholder="新しい支払者", min_values=1, max_values=1)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        payer_id = None
+        for item in self.children:
+            if isinstance(item, discord.ui.UserSelect) and item.values:
+                payer_id = str(item.values[0].id)
+        if not payer_id:
+            await interaction.response.send_message("支払者を選択してください。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await _apply_field_update(interaction, self.entry_id, "支払者ID", payer_id, self.target)
+        await interaction.edit_original_response(view=None)
+
+
+class EditParticipantsView(discord.ui.View):
+    def __init__(self, entry_id: int, target: dict):
+        super().__init__(timeout=180)
+        self.entry_id = entry_id
+        self.target = target
+        select = discord.ui.UserSelect(
+            placeholder="新しい参加者（複数可）", min_values=1, max_values=10
+        )
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        ids = []
+        for item in self.children:
+            if isinstance(item, discord.ui.UserSelect):
+                ids = [str(u.id) for u in item.values]
+        if not ids:
+            await interaction.response.send_message("参加者を選択してください。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        mentions = " ".join(f"<@{uid}>" for uid in ids)
+        await _apply_field_update(interaction, self.entry_id, "参加者ID", mentions, self.target)
+        await interaction.edit_original_response(view=None)
+
+
+@bot.tree.command(name="log_ed", description="IDを指定して記録を確認・修正します")
+@app_commands.describe(id="修正したい記録のID")
+async def log_ed(interaction: discord.Interaction, id: int):
+    await interaction.response.defer()
+    entries = await run_sync(get_store().get_all_entries)
     target = next((e for e in entries if str(e["ID"]) == str(id)), None)
     if target is None:
         await interaction.followup.send(f"ID {id} が見つかりませんでした。", ephemeral=True)
         return
 
-    # 金額 or 通貨を変更した場合は円換算額とレートも再計算する
-    if field.value in ("現地金額", "通貨"):
-        amount_local = float(value) if field.value == "現地金額" else float(target["現地金額"])
-        currency = value.upper() if field.value == "通貨" else target["通貨"]
-
-        try:
-            amount_jpy, rate = await run_sync(fx.convert_to_jpy, amount_local, currency)
-        except Exception as e:
-            await interaction.followup.send(f"為替レート取得に失敗しました: {e}", ephemeral=True)
-            return
-
-        await run_sync(st.update_field, id, "現地金額", str(amount_local))
-        await run_sync(st.update_field, id, "通貨", currency)
-        await run_sync(st.update_field, id, "レート", str(rate))
-        await run_sync(st.update_field, id, "円換算額", str(amount_jpy))
-
-        await interaction.followup.send(
-            f"✅ ID {id} を更新しました: {amount_local} {currency} → {amount_jpy:,.0f}円"
-        )
-        return
-
-    if field.value == "割り勘":
-        normalized = value.strip().upper()
-        if normalized not in ("ON", "OFF"):
-            await interaction.followup.send("割り勘の値は ON か OFF で指定してください。", ephemeral=True)
-            return
-        await run_sync(st.update_field, id, "割り勘", normalized)
-        await interaction.followup.send(f"✅ ID {id} の割り勘を {normalized} にしました。")
-        return
-
-    if field.value == "支払者ID":
-        ids = _parse_mentions(value)
-        if not ids:
-            await interaction.followup.send(
-                "支払者は @ユーザー名 の形式で1人だけメンションしてください。", ephemeral=True
-            )
-            return
-        await run_sync(st.update_field, id, "支払者ID", ids[0])
-        await interaction.followup.send(f"✅ ID {id} の支払者を <@{ids[0]}> にしました。")
-        return
-
-    if field.value == "参加者ID":
-        ids = _parse_mentions(value)
-        if not ids:
-            await interaction.followup.send(
-                "参加者は @ユーザー名 の形式でメンションしてください（複数可）。", ephemeral=True
-            )
-            return
-        payer = str(target.get("支払者ID", "")).strip()
-        if payer:
-            ids.append(payer)
-        ids = sorted(set(ids))
-        await run_sync(st.update_field, id, "参加者ID", ",".join(ids))
-        names = ", ".join(f"<@{uid}>" for uid in ids)
-        await interaction.followup.send(f"✅ ID {id} の参加者を更新しました: {names}")
-        return
-
-    ok = await run_sync(st.update_field, id, field.value, value)
-    if ok:
-        await interaction.followup.send(f"✅ ID {id} の「{field.value}」を更新しました: {value}")
-    else:
-        await interaction.followup.send(f"ID {id} が見つかりませんでした。", ephemeral=True)
+    await interaction.followup.send(
+        content="修正する項目を選んでください。",
+        embed=_entry_detail_embed(target),
+        view=EditFieldView(entry_id=id, target=target),
+    )
 
 
 @bot.tree.command(name="log_rm", description="IDを複数指定して記録を削除します")
