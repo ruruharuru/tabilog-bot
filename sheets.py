@@ -125,9 +125,10 @@ class SheetStore:
         split: bool,
         payer_id: str,
         participants: str,
+        recorded_at: str | None = None,
     ) -> int:
         new_id = self._next_id()
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        now = recorded_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         row = [
             new_id, entry_type, now, str(channel_id), country,
             amount_local, currency.upper(), rate, amount_jpy,

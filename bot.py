@@ -109,6 +109,8 @@ class EntryModal(discord.ui.Modal):
         super().__init__(title=f"{entry_type}を記録")
         self.entry_type = entry_type
 
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
         self.amount = discord.ui.TextInput(
             label="金額", placeholder="例: 250", required=True, max_length=20
         )
@@ -118,12 +120,20 @@ class EntryModal(discord.ui.Modal):
             required=False,
             max_length=10,
         )
+        self.recorded_at = discord.ui.TextInput(
+            label="日時 (YYYY-MM-DD HH:MM)",
+            default=now,
+            placeholder="例: 2026-07-25 18:30",
+            required=True,
+            max_length=19,
+        )
         self.memo = discord.ui.TextInput(
             label="メモ", required=False, max_length=200
         )
 
         self.add_item(self.amount)
         self.add_item(self.currency)
+        self.add_item(self.recorded_at)
         self.add_item(self.memo)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -133,6 +143,14 @@ class EntryModal(discord.ui.Modal):
         except ValueError:
             await interaction.response.send_message(
                 f"金額は数字で入力してください（入力値: {self.amount.value}）", ephemeral=True
+            )
+            return
+
+        recorded_at = _parse_datetime(self.recorded_at.value)
+        if not recorded_at:
+            await interaction.response.send_message(
+                "日時は `YYYY-MM-DD HH:MM` 形式で指定してください（例: `2026-07-25 18:30`）。",
+                ephemeral=True,
             )
             return
 
@@ -171,6 +189,7 @@ class EntryModal(discord.ui.Modal):
                 split=False,
                 payer_id="",
                 participants="",
+                recorded_at=recorded_at,
             )
             tags = await run_sync(st.list_tags)
         except Exception as e:
@@ -184,6 +203,7 @@ class EntryModal(discord.ui.Modal):
         embed = _entry_embed(
             entry_id, self.entry_type, country, amount_local, currency, amount_jpy, "", memo
         )
+        embed.insert_field_at(1, name="日時", value=recorded_at, inline=True)
         await interaction.followup.send(embed=embed)
 
         if self.entry_type == "支出":
