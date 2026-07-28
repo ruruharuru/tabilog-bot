@@ -4,7 +4,7 @@ TabiLog Bot - 世界一周の費用ログ用Discord Bot
 コマンド一覧:
   /log_ex      支出を記録（金額入力→タグ/割り勘を1画面で選択）
   /log_in      収入を記録（金額入力→タグを1画面で選択）
-  /log_ct      このチャンネルを国に紐付け
+  /log_ct      このスレッド/チャンネルを国に紐付け
   /log_tag_add タグを登録
   /log_tag_rm  タグを削除
   /log_tag_ls  登録タグ一覧
@@ -28,6 +28,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import fx
+import countries
 from sheets import SheetStore
 
 load_dotenv()
@@ -69,6 +70,23 @@ def _participant_ids(entry: dict) -> list[str]:
     return [uid for value in values if (uid := _valid_discord_id(value))]
 
 
+def _resolve_currency(
+    country: str,
+    binding: dict | None,
+    manual_input: str,
+) -> str:
+    """手入力 > Channels保存通貨 > 国名推定 > JPY の順で通貨を決める。"""
+    manual = manual_input.strip().upper()
+    if manual:
+        return manual
+    if not binding:
+        return "JPY"
+    stored = str(binding.get("通貨", "")).strip().upper()
+    if stored:
+        return stored
+    return countries.get_currency_for_country(country) or "JPY"
+
+
 def _entry_embed(
     entry_id: int,
     entry_type: str,
@@ -96,7 +114,9 @@ def _entry_embed(
     if memo:
         embed.add_field(name="メモ", value=memo, inline=False)
     if country == DEFAULT_COUNTRY:
-        embed.set_footer(text="国が未設定のチャンネルです。/log_ed で後から修正できます。")
+        embed.set_footer(
+            text="国が未設定です。このスレッド/チャンネルで /log_ct を実行してください。"
+        )
     return embed
 
 
@@ -115,8 +135,8 @@ class EntryModal(discord.ui.Modal):
             label="金額", placeholder="例: 250", required=True, max_length=20
         )
         self.currency = discord.ui.TextInput(
-            label="通貨（現地通貨コード。日本円ならJPYか空欄）",
-            placeholder="例: THB / USD / JPY",
+            label="通貨（省略時は国の通貨を自動）",
+            placeholder="空欄: /log_ct 設定国の通貨、未設定チャンネルは JPY",
             required=False,
             max_length=10,
         )
@@ -154,17 +174,21 @@ class EntryModal(discord.ui.Modal):
             )
             return
 
-        currency = (self.currency.value or "JPY").strip().upper()
-        memo = self.memo.value.strip()
-
         # Sheets/為替は数秒かかるので先に応答を確保する
         await interaction.response.defer()
 
         st = get_store()
-        channel_id = interaction.channel_id
+        channel_id = str(interaction.channel_id)
 
         try:
-            country = await run_sync(st.get_country_for_channel, channel_id) or DEFAULT_COUNTRY
+            # スレッド単位で国設定を参照（親チャンネルにはフォールバックしない）
+            binding = await run_sync(st.get_channel_binding, channel_id)
+            country = (binding or {}).get("国") or DEFAULT_COUNTRY
+            currency = _resolve_currency(
+                country,
+                binding,
+                self.currency.value or "",
+            )
             amount_jpy, rate = await run_sync(fx.convert_to_jpy, amount_local, currency)
         except Exception as e:
             await interaction.followup.send(
@@ -172,6 +196,8 @@ class EntryModal(discord.ui.Modal):
                 ephemeral=True,
             )
             return
+
+        memo = self.memo.value.strip()
 
         try:
             # タグ・割り勘は次の1画面で選ぶので、いったん空/OFFで保存する
@@ -210,11 +236,14 @@ class EntryModal(discord.ui.Modal):
             guide = (
                 f"ID {entry_id}: 下でまとめて選んでから確定してください。\n"
                 "・タグ（任意）\n"
-                "・割り勘あり → 支払者と参加者も選んで「割り勘ありで確定」\n"
-                "・割り勘なし → 「割り勘なしで確定」だけ押す"
+                "・割り勘あり → 支払者と参加者を選んで「割り勘ありで確定」\n"
+                "・集計対象にしたい場合は「集計対象: OFF」ボタンで ON に切り替え"
             )
         else:
-            guide = f"ID {entry_id}: タグを選んで「確定」を押してください（タグなしでもOK）。"
+            guide = (
+                f"ID {entry_id}: タグを選んで「確定」を押してください"
+                "（集計対象にしたい場合はボタンで ON に切り替え）。"
+            )
 
         await interaction.followup.send(
             content=guide,
@@ -229,14 +258,26 @@ class EntryOptionsView(discord.ui.View):
         super().__init__(timeout=300)
         self.entry_id = entry_id
         self.entry_type = entry_type
+        self.available_tags = tags[:25]
         self.selected_tags: list[str] = []
         self.payer_id: str | None = None
         self.participant_ids: set[str] = set()
+        self.include_in_sum = False
+        self._build_items()
 
-        if tags:
+    def _build_items(self):
+        """選択状態を default に反映しつつコンポーネントを組み立てる。"""
+        self.clear_items()
+        next_row = 0
+
+        if self.available_tags:
             options = [
-                discord.SelectOption(label=tag[:100], value=tag[:100])
-                for tag in tags[:25]
+                discord.SelectOption(
+                    label=tag[:100],
+                    value=tag[:100],
+                    default=tag in self.selected_tags,
+                )
+                for tag in self.available_tags
             ]
             tag_select = discord.ui.Select(
                 custom_id="entry_tags",
@@ -244,33 +285,74 @@ class EntryOptionsView(discord.ui.View):
                 min_values=0,
                 max_values=min(len(options), 25),
                 options=options,
+                row=next_row,
             )
             tag_select.callback = self.on_tags
             self.add_item(tag_select)
+            next_row += 1
 
-        if entry_type == "支出":
+        if self.entry_type == "支出":
+            payer_defaults = []
+            if self.payer_id:
+                payer_defaults = [
+                    discord.SelectDefaultValue(
+                        id=int(self.payer_id),
+                        type=discord.SelectDefaultValueType.user,
+                    )
+                ]
             payer_select = discord.ui.UserSelect(
                 custom_id="entry_payer",
                 placeholder="支払者（割り勘時は必須）",
                 min_values=0,
                 max_values=1,
+                row=next_row,
+                default_values=payer_defaults,
             )
             payer_select.callback = self.on_payer
             self.add_item(payer_select)
+            next_row += 1
 
+            participant_defaults = [
+                discord.SelectDefaultValue(
+                    id=int(uid),
+                    type=discord.SelectDefaultValueType.user,
+                )
+                for uid in sorted(self.participant_ids)
+            ]
             participants_select = discord.ui.UserSelect(
                 custom_id="entry_participants",
                 placeholder="参加者（割り勘時・複数可）",
                 min_values=0,
                 max_values=10,
+                row=next_row,
+                default_values=participant_defaults[:25],
             )
             participants_select.callback = self.on_participants
             self.add_item(participants_select)
+            next_row += 1
 
+        button_row = next_row
+
+        btn_toggle = discord.ui.Button(
+            label=f"集計対象: {'ON' if self.include_in_sum else 'OFF'}",
+            style=(
+                discord.ButtonStyle.success
+                if self.include_in_sum
+                else discord.ButtonStyle.danger
+            ),
+            custom_id="toggle_include_sum",
+            row=button_row,
+        )
+        btn_toggle.callback = self.toggle_include_sum
+        self.add_item(btn_toggle)
+        self._btn_toggle = btn_toggle
+
+        if self.entry_type == "支出":
             btn_split = discord.ui.Button(
                 label="割り勘ありで確定",
                 style=discord.ButtonStyle.primary,
                 custom_id="confirm_split",
+                row=button_row,
             )
             btn_split.callback = self.confirm_split
             self.add_item(btn_split)
@@ -279,6 +361,7 @@ class EntryOptionsView(discord.ui.View):
                 label="割り勘なしで確定",
                 style=discord.ButtonStyle.secondary,
                 custom_id="confirm_plain",
+                row=button_row,
             )
             btn_plain.callback = self.confirm_plain
             self.add_item(btn_plain)
@@ -287,9 +370,23 @@ class EntryOptionsView(discord.ui.View):
                 label="確定",
                 style=discord.ButtonStyle.primary,
                 custom_id="confirm_income",
+                row=button_row,
             )
             btn_ok.callback = self.confirm_plain
             self.add_item(btn_ok)
+
+    def _sync_selections(self):
+        """現在のコンポーネント値をインスタンスに保存する。"""
+        for item in self.children:
+            if isinstance(item, discord.ui.Select) and item.custom_id == "entry_tags":
+                if item.values:
+                    self.selected_tags = list(item.values)
+            elif isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_payer":
+                if item.values:
+                    self.payer_id = str(item.values[0].id)
+            elif isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_participants":
+                if item.values:
+                    self.participant_ids = {str(u.id) for u in item.values}
 
     async def on_tags(self, interaction: discord.Interaction):
         for item in self.children:
@@ -309,34 +406,62 @@ class EntryOptionsView(discord.ui.View):
                 self.participant_ids = {str(u.id) for u in item.values}
         await interaction.response.defer()
 
-    def _tags_str(self) -> str:
-        return ",".join(self.selected_tags)
+    async def toggle_include_sum(self, interaction: discord.Interaction):
+        self._sync_selections()
+        self.include_in_sum = not self.include_in_sum
+        self._build_items()
+        await interaction.response.edit_message(view=self)
+
+    def _collect_options(self) -> tuple[str, str | None, set[str], bool]:
+        """確定時点の選択値を返す（保存済み状態を優先）。"""
+        self._sync_selections()
+        return (
+            ",".join(self.selected_tags),
+            self.payer_id,
+            set(self.participant_ids),
+            self.include_in_sum,
+        )
+    async def _finish_message(self, interaction: discord.Interaction, content: str):
+        if interaction.message:
+            await interaction.message.edit(content=content, view=None)
+        else:
+            await interaction.followup.send(content)
 
     async def confirm_plain(self, interaction: discord.Interaction):
         await interaction.response.defer()
+        tags, _, _, include_in_sum = self._collect_options()
         st = get_store()
-        tags = self._tags_str()
         await run_sync(st.update_field, self.entry_id, "タグ", tags)
         await run_sync(st.update_field, self.entry_id, "割り勘", "OFF")
         await run_sync(st.update_field, self.entry_id, "支払者ID", "")
         await run_sync(st.update_split_participants, self.entry_id, "")
+        await run_sync(
+            st.update_field, self.entry_id, "集計対象", "ON" if include_in_sum else "OFF"
+        )
 
-        note = f"（タグ: {tags}）" if tags else "（タグなし）"
-        await interaction.edit_original_response(
-            content=f"✅ ID {self.entry_id} の記録が完了しました{note}",
-            view=None,
+        parts = []
+        if tags:
+            parts.append(f"タグ: {tags}")
+        if include_in_sum:
+            parts.append("集計対象: ON")
+        note = f"（{' / '.join(parts)}）" if parts else "（タグなし）"
+        await self._finish_message(
+            interaction,
+            f"✅ ID {self.entry_id} の記録が完了しました{note}",
         )
 
     async def confirm_split(self, interaction: discord.Interaction):
-        if not self.payer_id:
+        tags, payer_id, participant_ids, include_in_sum = self._collect_options()
+
+        if not payer_id:
             await interaction.response.send_message(
                 "割り勘ありの場合は、先に「支払者」を選んでから確定してください。",
                 ephemeral=True,
             )
             return
 
-        participants = set(self.participant_ids)
-        participants.add(self.payer_id)
+        participants = set(participant_ids)
+        participants.add(payer_id)
         if len(participants) < 2:
             await interaction.response.send_message(
                 "割り勘ありの場合は、支払者以外の参加者も1人以上選んでください。",
@@ -346,23 +471,27 @@ class EntryOptionsView(discord.ui.View):
 
         await interaction.response.defer()
         st = get_store()
-        tags = self._tags_str()
         participants_str = ",".join(sorted(participants))
         await run_sync(st.update_field, self.entry_id, "タグ", tags)
         await run_sync(st.update_field, self.entry_id, "割り勘", "ON")
-        await run_sync(st.update_field, self.entry_id, "支払者ID", self.payer_id)
+        await run_sync(st.update_field, self.entry_id, "支払者ID", payer_id)
         await run_sync(st.update_split_participants, self.entry_id, participants_str)
+        await run_sync(
+            st.update_field, self.entry_id, "集計対象", "ON" if include_in_sum else "OFF"
+        )
 
         names = ", ".join(f"<@{uid}>" for uid in sorted(participants))
         tag_note = f"タグ: {tags}\n" if tags else ""
-        await interaction.edit_original_response(
-            content=(
+        agg_note = "集計対象: ON\n" if include_in_sum else ""
+        await self._finish_message(
+            interaction,
+            (
                 f"✅ ID {self.entry_id} の割り勘記録が完了しました\n"
                 f"{tag_note}"
-                f"支払者: <@{self.payer_id}>\n"
+                f"{agg_note}"
+                f"支払者: <@{payer_id}>\n"
                 f"参加者: {names}"
             ),
-            view=None,
         )
 
 
@@ -397,14 +526,31 @@ async def log_in(interaction: discord.Interaction):
     await interaction.response.send_modal(EntryModal("収入"))
 
 
-@bot.tree.command(name="log_ct", description="このチャンネルを国/地域に紐付けます")
+@bot.tree.command(name="log_ct", description="このスレッド/チャンネルを国/地域に紐付けます")
 @app_commands.describe(country="紐付ける国/地域名（例: タイ）")
 async def log_ct(interaction: discord.Interaction, country: str):
     await interaction.response.defer()
-    await run_sync(get_store().bind_channel_country, interaction.channel_id, country)
-    await interaction.followup.send(
-        f"✅ このチャンネルを「{country}」に固定しました。以後 /log_ex や /log_in で国は自動設定されます。"
+    country_name = country.strip()
+    currency = countries.get_currency_for_country(country_name) or ""
+    # スレッド単位で保存（親チャンネルには影響しない）
+    await run_sync(
+        get_store().bind_channel_country,
+        interaction.channel_id,
+        country_name,
+        currency,
     )
+    message = (
+        f"✅ このスレッド/チャンネルを「{country_name}」に固定しました。"
+        "以後この場所での /log_ex や /log_in で国は自動設定されます。"
+    )
+    if currency:
+        message += f"\n通貨: **{currency}**（通貨欄が空欄のとき自動適用）"
+    else:
+        message += (
+            "\n⚠️ 国名から通貨を特定できませんでした。"
+            "記録時に通貨を手入力するか、国名を見直してください。"
+        )
+    await interaction.followup.send(message)
 
 
 @bot.tree.command(name="log_tag_add", description="記録用タグを登録します")
@@ -470,19 +616,65 @@ def _match_entry(entry: dict, country: str | None, tag: str | None) -> bool:
     return True
 
 
+def _is_included_in_sum(entry: dict) -> bool:
+    return str(entry.get("集計対象", "OFF")).strip().upper() == "ON"
+
+
+def _currency_totals(entries: list[dict], entry_type: str | None = None) -> dict[str, dict[str, float]]:
+    by_currency: dict[str, dict[str, float]] = defaultdict(lambda: {"local": 0.0, "jpy": 0.0})
+    for e in entries:
+        if entry_type and e.get("種別") != entry_type:
+            continue
+        cur = str(e.get("通貨") or "JPY").upper()
+        try:
+            local = float(e.get("現地金額") or 0)
+            jpy = float(e.get("円換算額") or 0)
+        except (TypeError, ValueError):
+            continue
+        by_currency[cur]["local"] += local
+        by_currency[cur]["jpy"] += jpy
+    return dict(by_currency)
+
+
+def _format_currency_breakdown(by_currency: dict[str, dict[str, float]]) -> str:
+    if not by_currency:
+        return "なし"
+    lines = []
+    for cur in sorted(by_currency.keys()):
+        local = by_currency[cur]["local"]
+        jpy = by_currency[cur]["jpy"]
+        if cur == "JPY":
+            lines.append(f"**{cur}**: {local:,.0f}円")
+        else:
+            lines.append(f"**{cur}**: {local:,.0f} (約{jpy:,.0f}円)")
+    return "\n".join(lines)
+
+
 @bot.tree.command(name="log_sum", description="国・タグで絞り込んで集計します")
 @app_commands.describe(country="絞り込む国（省略可）", tag="絞り込むタグ（省略可）")
 async def log_sum(interaction: discord.Interaction, country: str | None = None, tag: str | None = None):
     await interaction.response.defer()
     entries = await run_sync(get_store().get_all_entries)
-    filtered = [e for e in entries if _match_entry(e, country, tag)]
+    has_filter = bool(country or tag)
+    filtered = [
+        e for e in entries
+        if _match_entry(e, country, tag)
+        and (has_filter or _is_included_in_sum(e))
+    ]
 
     if not filtered:
-        await interaction.followup.send("該当する記録がありませんでした。")
+        if has_filter:
+            await interaction.followup.send("該当する記録がありませんでした。")
+        else:
+            await interaction.followup.send(
+                "該当する記録がありませんでした（集計対象ONの記録のみ集計します）。"
+            )
         return
 
-    total_expense = sum(e["円換算額"] for e in filtered if e["種別"] == "支出")
-    total_income = sum(e["円換算額"] for e in filtered if e["種別"] == "収入")
+    expense_entries = [e for e in filtered if e["種別"] == "支出"]
+    income_entries = [e for e in filtered if e["種別"] == "収入"]
+    total_expense = sum(e["円換算額"] for e in expense_entries)
+    total_income = sum(e["円換算額"] for e in income_entries)
 
     title_parts = []
     if country:
@@ -492,9 +684,24 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
     title = " / ".join(title_parts) if title_parts else "全期間"
 
     embed = discord.Embed(title=f"📊 集計: {title}", color=discord.Color.blue())
-    embed.add_field(name="支出合計", value=f"{total_expense:,.0f}円", inline=True)
-    embed.add_field(name="収入合計", value=f"{total_income:,.0f}円", inline=True)
+    embed.add_field(name="支出合計（円）", value=f"{total_expense:,.0f}円", inline=True)
+    embed.add_field(name="収入合計（円）", value=f"{total_income:,.0f}円", inline=True)
     embed.add_field(name="件数", value=f"{len(filtered)}件", inline=True)
+
+    expense_by_currency = _currency_totals(expense_entries)
+    income_by_currency = _currency_totals(income_entries)
+    if expense_by_currency:
+        embed.add_field(
+            name="支出（通貨別）",
+            value=_format_currency_breakdown(expense_by_currency),
+            inline=False,
+        )
+    if income_by_currency:
+        embed.add_field(
+            name="収入（通貨別）",
+            value=_format_currency_breakdown(income_by_currency),
+            inline=False,
+        )
 
     # 直近5件だけ内訳表示
     recent = filtered[-5:]
@@ -507,6 +714,9 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
     if lines:
         embed.add_field(name="直近の記録", value="\n".join(lines), inline=False)
 
+    if has_filter:
+        embed.set_footer(text="国・タグ指定時は集計対象OFFの記録も含みます")
+
     await interaction.followup.send(embed=embed)
 
 
@@ -518,15 +728,22 @@ async def log_all(interaction: discord.Interaction):
         await interaction.followup.send("記録がまだありません。")
         return
 
-    total_expense = sum(e["円換算額"] for e in entries if e["種別"] == "支出")
-    total_income = sum(e["円換算額"] for e in entries if e["種別"] == "収入")
+    aggregated = [e for e in entries if _is_included_in_sum(e)]
+    if not aggregated:
+        await interaction.followup.send(
+            "集計対象ONの記録がありません。記録時に集計対象をONにしてください。"
+        )
+        return
+
+    total_expense = sum(e["円換算額"] for e in aggregated if e["種別"] == "支出")
+    total_income = sum(e["円換算額"] for e in aggregated if e["種別"] == "収入")
 
     by_country = defaultdict(float)
-    for e in entries:
+    for e in aggregated:
         if e["種別"] == "支出":
             by_country[e.get("国", DEFAULT_COUNTRY)] += e["円換算額"]
 
-    embed = discord.Embed(title="🌍 全体サマリー", color=discord.Color.purple())
+    embed = discord.Embed(title="🌍 全体サマリー（集計対象ONのみ）", color=discord.Color.purple())
     embed.add_field(name="支出合計", value=f"{total_expense:,.0f}円", inline=True)
     embed.add_field(name="収入合計", value=f"{total_income:,.0f}円", inline=True)
     embed.add_field(name="収支", value=f"{total_income - total_expense:,.0f}円", inline=True)
@@ -577,6 +794,7 @@ EDIT_FIELDS = [
     ("タグ", "タグ"),
     ("メモ", "メモ"),
     ("国", "国"),
+    ("集計対象 ON/OFF", "集計対象"),
     ("割り勘ON/OFF", "割り勘"),
     ("支払者", "支払者ID"),
     ("参加者", "参加者ID"),
@@ -633,6 +851,7 @@ def _entry_detail_embed(entry: dict) -> discord.Embed:
     embed.add_field(name="金額", value=amount_text, inline=False)
     embed.add_field(name="タグ", value=str(entry.get("タグ") or "（なし）"), inline=True)
     embed.add_field(name="メモ", value=str(entry.get("メモ") or "（なし）"), inline=True)
+    embed.add_field(name="集計対象", value=str(entry.get("集計対象") or "OFF"), inline=True)
     embed.add_field(name="割り勘", value=str(entry.get("割り勘") or "OFF"), inline=True)
 
     participants = _participant_ids(entry)
@@ -711,6 +930,15 @@ async def _apply_field_update(
             return False
         await run_sync(st.update_field, entry_id, "割り勘", normalized)
         await reply(f"✅ ID {entry_id} の割り勘を {normalized} にしました。")
+        return True
+
+    if field == "集計対象":
+        normalized = value.strip().upper()
+        if normalized not in ("ON", "OFF"):
+            await reply("集計対象の値は ON か OFF で指定してください。", ephemeral=True)
+            return False
+        await run_sync(st.update_field, entry_id, "集計対象", normalized)
+        await reply(f"✅ ID {entry_id} の集計対象を {normalized} にしました。")
         return True
 
     if field == "支払者ID":
@@ -824,6 +1052,14 @@ class EditFieldView(discord.ui.View):
             )
             return
 
+        if field == "集計対象":
+            current = str(self.target.get("集計対象") or "OFF")
+            await interaction.response.edit_message(
+                content=f"ID {self.entry_id}: 集計対象を選んでください（現在: {current}）",
+                view=EditIncludeSumView(self.entry_id, self.target),
+            )
+            return
+
         if field == "支払者ID":
             current = _mention_or_raw(str(self.target.get("支払者ID", "")))
             await interaction.response.edit_message(
@@ -875,6 +1111,25 @@ class EditSplitView(discord.ui.View):
     async def set_off(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         await _apply_field_update(interaction, self.entry_id, "割り勘", "OFF", self.target)
+        await interaction.edit_original_response(view=None)
+
+
+class EditIncludeSumView(discord.ui.View):
+    def __init__(self, entry_id: int, target: dict):
+        super().__init__(timeout=180)
+        self.entry_id = entry_id
+        self.target = target
+
+    @discord.ui.button(label="ON", style=discord.ButtonStyle.success)
+    async def set_on(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await _apply_field_update(interaction, self.entry_id, "集計対象", "ON", self.target)
+        await interaction.edit_original_response(view=None)
+
+    @discord.ui.button(label="OFF", style=discord.ButtonStyle.danger)
+    async def set_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await _apply_field_update(interaction, self.entry_id, "集計対象", "OFF", self.target)
         await interaction.edit_original_response(view=None)
 
 
@@ -1041,6 +1296,19 @@ async def log_wari(interaction: discord.Interaction, country: str | None = None)
     lines = [f"<@{a}> → <@{b}> に {amt:,.0f}円" for a, b, amt in transactions]
     title = f"💰 割り勘精算" + (f"（{country}）" if country else "")
     embed = discord.Embed(title=title, description="\n".join(lines), color=discord.Color.gold())
+
+    split_by_currency = _currency_totals(split_entries, "支出")
+    if split_by_currency:
+        embed.add_field(
+            name="割り勘対象（通貨別）",
+            value=_format_currency_breakdown(split_by_currency),
+            inline=False,
+        )
+    invalid_set = set(invalid_entry_ids)
+    valid_entries = [e for e in split_entries if str(e.get("ID", "?")) not in invalid_set]
+    total_jpy = sum(float(e["円換算額"]) for e in valid_entries)
+    embed.add_field(name="割り勘対象合計（円）", value=f"{total_jpy:,.0f}円", inline=False)
+
     if invalid_entry_ids:
         embed.set_footer(
             text=f"参加者データ破損のため除外: ID {', '.join(invalid_entry_ids)}"

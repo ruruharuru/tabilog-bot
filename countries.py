@@ -3,9 +3,15 @@
 /log_ct で登録した国名から、通貨欄が空のときに自動で通貨を推定する。
 日本語名・英語名・一般的な別名に対応。
 """
+import re
+import unicodedata
 
 # 正規化した国名 -> 通貨コード
 _COUNTRY_CURRENCY: dict[str, str] = {}
+
+_COUNTRY_SUFFIX_RE = re.compile(
+    r"(王国|共和国|民主共和国|連邦|公国|国|地方|地域|地区)$"
+)
 
 def _add(names: list[str], currency: str) -> None:
     for name in names:
@@ -123,8 +129,31 @@ _add(["フィジー", "fiji"], "FJD")
 _add(["パプアニューギニア", "papua new guinea"], "PGK")
 
 
+def _normalize_country_name(country: str) -> str:
+    text = unicodedata.normalize("NFKC", str(country).strip())
+    text = _COUNTRY_SUFFIX_RE.sub("", text).strip()
+    return text.lower()
+
+
 def get_currency_for_country(country: str) -> str | None:
     """国名から通貨コードを返す。見つからなければ None。"""
-    if not country or country == "不明":
+    if not country or str(country).strip() == "不明":
         return None
-    return _COUNTRY_CURRENCY.get(country.strip().lower())
+
+    normalized = _normalize_country_name(country)
+    if not normalized:
+        return None
+
+    direct = _COUNTRY_CURRENCY.get(normalized)
+    if direct:
+        return direct
+
+    # 「タイ・バンコク」「タイ（バンコク）」などの表記ゆれに対応
+    for part in re.split(r"[\s/・,、()（）\[\]【】]+", normalized):
+        if not part:
+            continue
+        part = _COUNTRY_SUFFIX_RE.sub("", part).strip()
+        if part in _COUNTRY_CURRENCY:
+            return _COUNTRY_CURRENCY[part]
+
+    return None
