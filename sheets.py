@@ -13,6 +13,7 @@ Google Sheets 操作モジュール
 ID列は numericise_ignore で除外する必要がある。
 """
 import os
+import re
 import json
 import datetime
 import gspread
@@ -25,9 +26,9 @@ SCOPES = [
 LOG_HEADERS = [
     "ID", "種別", "日時", "チャンネルID", "国",
     "現地金額", "通貨", "レート", "円換算額",
-    "タグ", "メモ", "割り勘", "支払者ID", "参加者ID",
+    "タグ", "メモ", "割り勘", "支払者ID", "参加者ID", "集計対象",
 ]
-CHANNEL_HEADERS = ["チャンネルID", "国"]
+CHANNEL_HEADERS = ["チャンネルID", "国", "通貨"]
 TAG_HEADERS = ["タグ"]
 
 ID_LIKE_FIELDS = {"チャンネルID", "支払者ID", "参加者ID"}
@@ -45,6 +46,23 @@ def _clean_id_text(value) -> str:
     return str(value).strip().lstrip("'")
 
 
+def _normalize_channel_id(value) -> str:
+    """Sheets上で数値化されたDiscord IDを文字列IDに戻す。"""
+    text = _clean_id_text(value)
+    if not text:
+        return ""
+    try:
+        if re.search(r"[eE.]", text):
+            return str(int(float(text)))
+    except (ValueError, OverflowError):
+        pass
+    if text.endswith(".0"):
+        base = text[:-2]
+        if base.isdigit():
+            return base
+    return text
+
+
 def _id_column_indexes(headers: list[str]) -> list[int]:
     """gspreadのnumericiseがカンマを千位区切りとして消すのを避ける列番号(1始まり)。"""
     return [headers.index(name) + 1 for name in ID_LIKE_FIELDS if name in headers]
@@ -58,7 +76,29 @@ class SheetStore:
         self.log_ws = self._get_or_create_ws("Log", LOG_HEADERS)
         self.channel_ws = self._get_or_create_ws("Channels", CHANNEL_HEADERS)
         self.tag_ws = self._get_or_create_ws("Tags", TAG_HEADERS)
+        self._ensure_log_headers()
+        self._ensure_channel_headers()
         self._ensure_default_tags()
+
+    def _ensure_channel_headers(self):
+        """既存Channelsシートに通貨列が無ければヘッダーを拡張する。"""
+        first_row = self.channel_ws.row_values(1)
+        if not first_row:
+            self.channel_ws.append_row(CHANNEL_HEADERS, value_input_option="RAW")
+            return
+        missing = [h for h in CHANNEL_HEADERS if h not in first_row]
+        if missing:
+            self.channel_ws.update([first_row + missing], "A1", raw=True)
+
+    def _ensure_log_headers(self):
+        """既存Logシートに新列が無ければヘッダーを拡張する。"""
+        first_row = self.log_ws.row_values(1)
+        if not first_row:
+            self.log_ws.append_row(LOG_HEADERS, value_input_option="RAW")
+            return
+        missing = [h for h in LOG_HEADERS if h not in first_row]
+        if missing:
+            self.log_ws.update([first_row + missing], "A1", raw=True)
 
     def _get_or_create_ws(self, title, headers):
         try:
@@ -83,26 +123,55 @@ class SheetStore:
 
     # ---------- Channel <-> Country ----------
 
-    def bind_channel_country(self, channel_id: str, country: str):
+    def bind_channel_country(
+        self, channel_id: str | int, country: str, currency: str | None = None
+    ):
+        country = str(country).strip()
+        currency = str(currency or "").strip().upper()
+        target_id = _normalize_channel_id(channel_id)
         records = self.channel_ws.get_all_records(
             numericise_ignore=_id_column_indexes(CHANNEL_HEADERS)
         )
         for i, row in enumerate(records, start=2):  # 2行目からデータ
-            if _clean_id_text(row["チャンネルID"]) == str(channel_id):
-                self.channel_ws.update([[country]], range_name=f"B{i}", raw=True)
+            if _normalize_channel_id(row["チャンネルID"]) == target_id:
+                self.channel_ws.update(
+                    [[country, currency]], range_name=f"B{i}:C{i}", raw=True
+                )
                 return
         self.channel_ws.append_row(
-            [str(channel_id), country], value_input_option="RAW"
+            [target_id, country, currency], value_input_option="RAW"
         )
 
-    def get_country_for_channel(self, channel_id: str) -> str | None:
+    def get_channel_binding(self, channel_id: str | int) -> dict | None:
+        target_id = _normalize_channel_id(channel_id)
+        if not target_id:
+            return None
         records = self.channel_ws.get_all_records(
             numericise_ignore=_id_column_indexes(CHANNEL_HEADERS)
         )
         for row in records:
-            if _clean_id_text(row["チャンネルID"]) == str(channel_id):
-                return row["国"]
+            if _normalize_channel_id(row["チャンネルID"]) != target_id:
+                continue
+            country = str(row.get("国", "")).strip()
+            if not country:
+                return None
+            return {
+                "国": country,
+                "通貨": str(row.get("通貨", "")).strip().upper(),
+            }
         return None
+
+    def resolve_channel_binding(self, *channel_ids: str | int) -> dict | None:
+        """複数チャンネルIDを順に試し、最初に見つかった国設定を返す。"""
+        for channel_id in channel_ids:
+            binding = self.get_channel_binding(channel_id)
+            if binding:
+                return binding
+        return None
+
+    def get_country_for_channel(self, channel_id: str | int) -> str | None:
+        binding = self.get_channel_binding(channel_id)
+        return binding["国"] if binding else None
 
     # ---------- Log entries ----------
 
@@ -126,6 +195,7 @@ class SheetStore:
         payer_id: str,
         participants: str,
         recorded_at: str | None = None,
+        include_in_sum: bool = False,
     ) -> int:
         new_id = self._next_id()
         now = recorded_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -135,6 +205,7 @@ class SheetStore:
             tags, memo, "ON" if split else "OFF",
             str(payer_id) if payer_id else "",
             str(participants),
+            "ON" if include_in_sum else "OFF",
         ]
         self.log_ws.append_row(row, value_input_option="RAW")
         return new_id
