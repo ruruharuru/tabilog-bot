@@ -8,12 +8,12 @@ TabiLog Bot - 世界一周の費用ログ用Discord Bot
   /log_tag_add タグを登録
   /log_tag_rm  タグを削除
   /log_tag_ls  登録タグ一覧
-  /log_sum     国・タグで絞り込み集計
+  /log_sum     国・タグで絞り込み集計（自分だけに表示）
   /log_all     全体サマリー
-  /log_ls      ID付き一覧表示
+  /log_ls      ID付き一覧表示（自分だけに表示）
   /log_ed      IDを指定して記録を確認・修正
   /log_rm      IDを複数指定して削除
-  /log_wari    割り勘の精算計算
+  /log_wari    割り勘の精算計算（メンションあり）
 """
 import asyncio
 import datetime
@@ -40,11 +40,41 @@ DEFAULT_COUNTRY = "不明"  # 国が紐付いていないチャンネル用の�
 DISCORD_ID_RE = re.compile(r"\d{17,20}")
 MENTION_RE = re.compile(r"<@!?(\d{17,20})>")
 
+
+def _load_default_participant_ids() -> list[str]:
+    """DEFAULT_SPLIT_PARTICIPANT_IDS からデフォルト参加者IDを読む（カンマ/空白区切り）。"""
+    raw = os.environ.get("DEFAULT_SPLIT_PARTICIPANT_IDS", "")
+    ids = []
+    for token in re.split(r"[\s,、]+", raw):
+        token = token.strip()
+        if DISCORD_ID_RE.fullmatch(token) and token not in ids:
+            ids.append(token)
+    # UserSelect の max_values に合わせて上限を切る
+    return ids[:10]
+
+
+DEFAULT_SPLIT_PARTICIPANT_IDS = _load_default_participant_ids()
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 store: SheetStore | None = None
+
+
+async def _exclude_bot_user_ids(user_ids: list[str]) -> list[str]:
+    """Botアカウントを除外したユーザーIDを返す。取得失敗時は元のIDを残す。"""
+    human_ids = []
+    for user_id in user_ids:
+        user = bot.get_user(int(user_id))
+        if user is None:
+            try:
+                user = await bot.fetch_user(int(user_id))
+            except discord.HTTPException:
+                user = None
+        if user is None or not user.bot:
+            human_ids.append(user_id)
+    return human_ids
 
 
 def get_store() -> SheetStore:
@@ -239,29 +269,50 @@ class EntryModal(discord.ui.Modal):
                 "・割り勘あり → 支払者と参加者を選んで「割り勘ありで確定」\n"
                 "・集計対象にしたい場合は「集計対象: OFF」ボタンで ON に切り替え"
             )
+            if DEFAULT_SPLIT_PARTICIPANT_IDS:
+                guide += "\n※参加者は既定メンバーを選択済み（変更可）"
         else:
             guide = (
                 f"ID {entry_id}: タグを選んで「確定」を押してください"
                 "（集計対象にしたい場合はボタンで ON に切り替え）。"
             )
 
+        default_participant_ids = []
+        if self.entry_type == "支出":
+            default_participant_ids = await _exclude_bot_user_ids(
+                DEFAULT_SPLIT_PARTICIPANT_IDS
+            )
+
         await interaction.followup.send(
             content=guide,
-            view=EntryOptionsView(entry_id=entry_id, entry_type=self.entry_type, tags=tags),
+            view=EntryOptionsView(
+                entry_id=entry_id,
+                entry_type=self.entry_type,
+                tags=tags,
+                default_participant_ids=default_participant_ids,
+            ),
         )
 
 
 class EntryOptionsView(discord.ui.View):
     """タグ・支払者・参加者を1メッセージ内で選び、ボタンで確定する。"""
 
-    def __init__(self, entry_id: int, entry_type: str, tags: list[str]):
+    def __init__(
+        self,
+        entry_id: int,
+        entry_type: str,
+        tags: list[str],
+        default_participant_ids: list[str] | None = None,
+    ):
         super().__init__(timeout=300)
         self.entry_id = entry_id
         self.entry_type = entry_type
         self.available_tags = tags[:25]
         self.selected_tags: list[str] = []
         self.payer_id: str | None = None
-        self.participant_ids: set[str] = set()
+        self.participant_ids: set[str] = (
+            set(default_participant_ids or []) if entry_type == "支出" else set()
+        )
         self.include_in_sum = False
         self._build_items()
 
@@ -383,10 +434,13 @@ class EntryOptionsView(discord.ui.View):
                     self.selected_tags = list(item.values)
             elif isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_payer":
                 if item.values:
-                    self.payer_id = str(item.values[0].id)
+                    payer = item.values[0]
+                    self.payer_id = None if payer.bot else str(payer.id)
             elif isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_participants":
                 if item.values:
-                    self.participant_ids = {str(u.id) for u in item.values}
+                    self.participant_ids = {
+                        str(user.id) for user in item.values if not user.bot
+                    }
 
     async def on_tags(self, interaction: discord.Interaction):
         for item in self.children:
@@ -395,16 +449,37 @@ class EntryOptionsView(discord.ui.View):
         await interaction.response.defer()
 
     async def on_payer(self, interaction: discord.Interaction):
+        bot_selected = False
         for item in self.children:
             if isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_payer":
-                self.payer_id = str(item.values[0].id) if item.values else None
-        await interaction.response.defer()
+                payer = item.values[0] if item.values else None
+                bot_selected = bool(payer and payer.bot)
+                self.payer_id = str(payer.id) if payer and not payer.bot else None
+        if bot_selected:
+            self._build_items()
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send(
+                "Botは支払者に選択できません。", ephemeral=True
+            )
+        else:
+            await interaction.response.defer()
 
     async def on_participants(self, interaction: discord.Interaction):
+        bot_selected = False
         for item in self.children:
             if isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_participants":
-                self.participant_ids = {str(u.id) for u in item.values}
-        await interaction.response.defer()
+                bot_selected = any(user.bot for user in item.values)
+                self.participant_ids = {
+                    str(user.id) for user in item.values if not user.bot
+                }
+        if bot_selected:
+            self._build_items()
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send(
+                "Botは割り勘参加者に選択できません。", ephemeral=True
+            )
+        else:
+            await interaction.response.defer()
 
     async def toggle_include_sum(self, interaction: discord.Interaction):
         self._sync_selections()
@@ -591,19 +666,59 @@ async def log_tag_ls(interaction: discord.Interaction):
     await interaction.followup.send("🏷 登録タグ: " + ", ".join(f"`{t}`" for t in tags))
 
 
-def _split_summary(entry: dict) -> str:
-    """割り勘対象の記録なら、支払者・参加者を短い文字列にして返す（対象外なら空文字）"""
+def _split_summary(entry: dict, *, name_of=None) -> str:
+    """割り勘対象の記録なら、支払者・参加者を短い文字列にして返す（対象外なら空文字）。
+
+    name_of を渡すとメンションではなく表示名で出す（log_sum / log_ls 用）。
+    省略時は <@ID> メンション（log_wari など向け）。
+    """
     if entry.get("割り勘") != "ON":
         return ""
     payer = _valid_discord_id(entry.get("支払者ID", ""))
     participants = _participant_ids(entry)
+
+    def label(uid: str) -> str:
+        if name_of:
+            return name_of(uid)
+        return f"<@{uid}>"
+
     if not payer:
         return "  ⚠️割り勘ONですが支払者未設定"
     if not participants:
-        return f"  ⚠️参加者IDが未設定または破損（支払者:<@{payer}>）"
+        return f"  ⚠️参加者IDが未設定または破損（支払者:{label(payer)}）"
     others = [p for p in participants if p != payer]
-    others_str = " ".join(f"<@{p}>" for p in others) if others else "なし"
-    return f"  💰割り勘 支払者:<@{payer}> 参加者:{others_str}"
+    others_str = " ".join(label(p) for p in others) if others else "なし"
+    return f"  💰割り勘 支払者:{label(payer)} 参加者:{others_str}"
+
+
+async def _build_name_resolver(guild: discord.Guild | None, user_ids: set[str]):
+    """ユーザーID → 表示名の辞書を作る。メンションは使わない。"""
+    names: dict[str, str] = {}
+    for uid in user_ids:
+        if not uid or uid in names:
+            continue
+        member = guild.get_member(int(uid)) if guild else None
+        if member is not None:
+            names[uid] = member.display_name
+            continue
+        try:
+            user = await bot.fetch_user(int(uid))
+            names[uid] = user.global_name or user.name
+        except Exception:
+            names[uid] = f"不明({uid[-4:]})"
+    return lambda uid: names.get(uid, f"不明({uid[-4:]})")
+
+
+def _collect_split_user_ids(entries: list[dict]) -> set[str]:
+    ids: set[str] = set()
+    for e in entries:
+        if e.get("割り勘") != "ON":
+            continue
+        payer = _valid_discord_id(e.get("支払者ID", ""))
+        if payer:
+            ids.add(payer)
+        ids.update(_participant_ids(e))
+    return ids
 
 
 def _match_entry(entry: dict, country: str | None, tag: str | None) -> bool:
@@ -650,10 +765,10 @@ def _format_currency_breakdown(by_currency: dict[str, dict[str, float]]) -> str:
     return "\n".join(lines)
 
 
-@bot.tree.command(name="log_sum", description="国・タグで絞り込んで集計します")
+@bot.tree.command(name="log_sum", description="国・タグで絞り込んで集計します（自分だけに表示）")
 @app_commands.describe(country="絞り込む国（省略可）", tag="絞り込むタグ（省略可）")
 async def log_sum(interaction: discord.Interaction, country: str | None = None, tag: str | None = None):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
     entries = await run_sync(get_store().get_all_entries)
     has_filter = bool(country or tag)
     filtered = [
@@ -664,10 +779,11 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
 
     if not filtered:
         if has_filter:
-            await interaction.followup.send("該当する記録がありませんでした。")
+            await interaction.followup.send("該当する記録がありませんでした。", ephemeral=True)
         else:
             await interaction.followup.send(
-                "該当する記録がありませんでした（集計対象ONの記録のみ集計します）。"
+                "該当する記録がありませんでした（集計対象ONの記録のみ集計します）。",
+                ephemeral=True,
             )
         return
 
@@ -675,6 +791,7 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
     income_entries = [e for e in filtered if e["種別"] == "収入"]
     total_expense = sum(e["円換算額"] for e in expense_entries)
     total_income = sum(e["円換算額"] for e in income_entries)
+    balance = total_income - total_expense
 
     title_parts = []
     if country:
@@ -686,6 +803,7 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
     embed = discord.Embed(title=f"📊 集計: {title}", color=discord.Color.blue())
     embed.add_field(name="支出合計（円）", value=f"{total_expense:,.0f}円", inline=True)
     embed.add_field(name="収入合計（円）", value=f"{total_income:,.0f}円", inline=True)
+    embed.add_field(name="残高（収入 − 支出）", value=f"{balance:,.0f}円", inline=True)
     embed.add_field(name="件数", value=f"{len(filtered)}件", inline=True)
 
     expense_by_currency = _currency_totals(expense_entries)
@@ -703,13 +821,16 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
             inline=False,
         )
 
-    # 直近5件だけ内訳表示
+    # 直近5件だけ内訳表示（メンションせず表示名のみ）
     recent = filtered[-5:]
+    name_of = await _build_name_resolver(
+        interaction.guild, _collect_split_user_ids(recent)
+    )
     lines = []
     for e in recent:
         sign = "-" if e["種別"] == "支出" else "+"
         line = f"[{e['ID']}] {sign}{e['円換算額']:,.0f}円 {e.get('タグ','')} {e.get('メモ','')}"
-        line += _split_summary(e)
+        line += _split_summary(e, name_of=name_of)
         lines.append(line)
     if lines:
         embed.add_field(name="直近の記録", value="\n".join(lines), inline=False)
@@ -717,7 +838,7 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
     if has_filter:
         embed.set_footer(text="国・タグ指定時は集計対象OFFの記録も含みます")
 
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="log_all", description="全体サマリー（国別内訳つき）")
@@ -755,18 +876,21 @@ async def log_all(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="log_ls", description="ID付きで記録を一覧表示します（直近20件）")
+@bot.tree.command(name="log_ls", description="ID付きで記録を一覧表示します（直近20件・自分だけに表示）")
 @app_commands.describe(country="絞り込む国（省略可）")
 async def log_ls(interaction: discord.Interaction, country: str | None = None):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
     entries = await run_sync(get_store().get_all_entries)
     filtered = [e for e in entries if _match_entry(e, country, None)]
     filtered = filtered[-20:]
 
     if not filtered:
-        await interaction.followup.send("該当する記録がありませんでした。")
+        await interaction.followup.send("該当する記録がありませんでした。", ephemeral=True)
         return
 
+    name_of = await _build_name_resolver(
+        interaction.guild, _collect_split_user_ids(filtered)
+    )
     lines = []
     for e in filtered:
         sign = "-" if e["種別"] == "支出" else "+"
@@ -774,7 +898,7 @@ async def log_ls(interaction: discord.Interaction, country: str | None = None):
             f"**[{e['ID']}]** {e['日時']} {sign}{e['円換算額']:,.0f}円 {e.get('国','')} "
             f"{e.get('タグ','')} {e.get('メモ','')}"
         )
-        split_note = _split_summary(e)
+        split_note = _split_summary(e, name_of=name_of)
         if split_note:
             line += "\n" + split_note
         lines.append(line)
@@ -784,7 +908,7 @@ async def log_ls(interaction: discord.Interaction, country: str | None = None):
         text = text[-4000:]
 
     embed = discord.Embed(title="📋 記録一覧", description=text, color=discord.Color.blue())
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 EDIT_FIELDS = [
