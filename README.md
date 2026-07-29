@@ -2,21 +2,24 @@
 
 世界一周の費用ログをDiscord上で記録・集計・割り勘精算できるBotです。
 
+> **初めて使う人へ**: Discord上の操作は [使い方ガイド](docs/使い方.md) を見てください（図付き）。
+
 ## コマンド一覧
 
 | コマンド | 内容 |
 |---|---|
-| `/log_ex` | 支出を記録（モーダル入力。割り勘ONなら参加者選択が続く） |
-| `/log_in` | 収入を記録（モーダル入力） |
-| `/log_ct` | このチャンネルを国/地域に紐付け |
-| `/log_sum` | 国・タグで絞り込み集計 |
+| `/log_ex` | 支出を記録（金額入力→タグ・割り勘・集計対象を選択） |
+| `/log_in` | 収入を記録（金額入力→タグ・集計対象を選択） |
+| `/log_ct` | このスレッド/チャンネルを国/地域に紐付け |
+| `/log_tag_add` / `rm` / `ls` | タグの追加・削除・一覧 |
+| `/log_sum` | 国・タグで絞り込み集計（自分だけに表示・残高つき） |
 | `/log_all` | 全体サマリー（国別内訳つき） |
-| `/log_ls` | ID付きで直近の記録を一覧表示 |
-| `/log_ed` | IDを指定して項目を修正 |
-| `/log_rm` | IDを指定して削除 |
-| `/log_wari` | 割り勘の精算額を計算 |
+| `/log_ls` | ID付きで直近の記録を一覧表示（自分だけに表示） |
+| `/log_ed` | IDを指定して記録を確認・修正 |
+| `/log_rm` | IDを複数指定して削除 |
+| `/log_wari` | 割り勘の精算額を計算（メンションあり） |
 
-金額は現地通貨で入力すると、[frankfurter.app](https://frankfurter.app)（無料・APIキー不要）で自動的に円換算されます。
+金額は現地通貨で入力すると、自動的に円換算されます。
 
 ## 1. ローカルでのセットアップ
 
@@ -54,6 +57,14 @@ cp .env.example .env
 3. **GOOGLE_SHEET_ID**
    スプレッドシートのURL `https://docs.google.com/spreadsheets/d/【この部分】/edit` の【この部分】
 
+任意で、以下も設定できます。
+
+- **DEFAULT_SPLIT_PARTICIPANT_IDS**
+  割り勘の参加者欄に最初から選択しておくユーザーID（カンマ区切り、最大10人）。
+  例: `DEFAULT_SPLIT_PARTICIPANT_IDS=123456789012345678,223456789012345678`
+  IDは Discord の設定 → 詳細設定で「開発者モード」をONにし、
+  ユーザーを右クリック →「ユーザーIDをコピー」で取得できます。
+
 ### 起動
 
 ```bash
@@ -84,10 +95,11 @@ Discordの任意のテキストチャンネルで:
 
 1. このフォルダをGitHubリポジトリにpush（`.env` は `.gitignore` で除外されるので安全です）
 2. [Railway](https://railway.app) にログイン →「New Project」→「Deploy from GitHub repo」→ このリポジトリを選択
-3. Railwayのプロジェクト設定 →「Variables」タブで、`.env` に書いた3つの環境変数を1つずつ登録
+3. Railwayのプロジェクト設定 →「Variables」タブで、`.env` に書いた環境変数を登録
    - `DISCORD_BOT_TOKEN`
    - `GOOGLE_SERVICE_ACCOUNT_JSON`
    - `GOOGLE_SHEET_ID`
+   - （任意）`DEFAULT_SPLIT_PARTICIPANT_IDS`
 4. 「Settings」→「Start Command」に `python bot.py` を設定（自動検出されない場合）
 5. デプロイが完了すると、Discord上でbotが常時「オンライン」になります
 
