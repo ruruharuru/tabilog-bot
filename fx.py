@@ -5,6 +5,7 @@ frankfurter.app はECB基準のため主要30通貨程度しか扱えずマイ�
 166通貨に対応したこちらに切り替えている。
 軽くキャッシュして、同じ通貨への無駄なリクエストを減らす。
 """
+import math
 import time
 import requests
 
@@ -45,8 +46,9 @@ def get_rate_to_jpy(currency: str) -> float:
 
 def convert_to_jpy(amount: float, currency: str) -> tuple[float, float]:
     """
-    (換算後のJPY金額, 適用したレート) を返す
+    (換算後のJPY金額, 適用したレート) を返す。
+    円は小数が出たら切り上げ（ceil）して整数円にする。
     """
     rate = get_rate_to_jpy(currency)
-    jpy = round(amount * rate)
+    jpy = int(math.ceil(amount * rate - 1e-12)) if amount > 0 else 0
     return jpy, rate
