@@ -109,12 +109,46 @@ def _resolve_currency(
     manual = manual_input.strip().upper()
     if manual:
         return manual
-    if not binding:
-        return "JPY"
-    stored = str(binding.get("通貨", "")).strip().upper()
-    if stored:
-        return stored
+    if binding:
+        stored = str(binding.get("通貨", "")).strip().upper()
+        if stored:
+            return stored
     return countries.get_currency_for_country(country) or "JPY"
+
+
+def _parse_amount(value: str) -> float:
+    """金額文字列を float に変換する。カンマ区切りや全角小数点にも対応。"""
+    text = str(value).strip()
+    text = text.replace("，", "").replace(",", "").replace("．", ".")
+    text = text.replace("￥", "").replace("¥", "").replace(" ", "")
+    if not text:
+        raise ValueError("empty amount")
+    amount = float(text)
+    if amount < 0:
+        raise ValueError("negative amount")
+    return amount
+
+
+def _format_amount(amount: float | int | str, *, decimals: int | None = None) -> str:
+    """表示用金額。整数は小数なし、それ以外は必要な桁だけ出す。"""
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return str(amount)
+    if decimals is not None:
+        formatted = f"{value:,.{decimals}f}"
+        return formatted.rstrip("0").rstrip(".") if decimals > 0 else formatted
+    if value.is_integer():
+        return f"{value:,.0f}"
+    return f"{value:,.4f}".rstrip("0").rstrip(".")
+
+
+def _resolve_country(binding: dict | None, manual_input: str) -> str:
+    """/log_ct 設定があればそれを優先。なければ手入力、空なら不明。"""
+    if binding and str(binding.get("国", "")).strip():
+        return str(binding["国"]).strip()
+    manual = (manual_input or "").strip()
+    return manual or DEFAULT_COUNTRY
 
 
 def _entry_embed(
@@ -135,17 +169,23 @@ def _entry_embed(
     embed.add_field(name="国", value=country, inline=True)
     if currency != "JPY":
         embed.add_field(
-            name="金額", value=f"{amount_local:,.0f} {currency} → 約{amount_jpy:,.0f}円", inline=False
+            name="金額",
+            value=f"{_format_amount(amount_local)} {currency} → 約{_format_amount(amount_jpy)}円",
+            inline=False,
         )
     else:
-        embed.add_field(name="金額", value=f"{amount_jpy:,.0f}円", inline=False)
+        embed.add_field(
+            name="金額",
+            value=f"{_format_amount(amount_jpy)}円",
+            inline=False,
+        )
     if tags:
         embed.add_field(name="タグ", value=tags, inline=True)
     if memo:
         embed.add_field(name="メモ", value=memo, inline=False)
     if country == DEFAULT_COUNTRY:
         embed.set_footer(
-            text="国が未設定です。このスレッド/チャンネルで /log_ct を実行してください。"
+            text="国が未設定です。フォームの国欄に入力するか、/log_ct でスレッドに国を固定できます。"
         )
     return embed
 
@@ -155,20 +195,38 @@ def _entry_embed(
 # ---------------------------------------------------------------------------
 
 class EntryModal(discord.ui.Modal):
-    def __init__(self, entry_type: str):
+    def __init__(self, entry_type: str, channel_id: int | str | None = None):
         super().__init__(title=f"{entry_type}を記録")
         self.entry_type = entry_type
 
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        country_default = DEFAULT_COUNTRY
+        if channel_id is not None:
+            try:
+                binding = get_store().get_channel_binding(channel_id)
+                if binding and str(binding.get("国", "")).strip():
+                    country_default = str(binding["国"]).strip()
+            except Exception:
+                log.exception("failed to prefetch channel country for modal")
 
         self.amount = discord.ui.TextInput(
-            label="金額", placeholder="例: 250", required=True, max_length=20
+            label="金額",
+            placeholder="例: 250 または 12.5",
+            required=True,
+            max_length=20,
         )
         self.currency = discord.ui.TextInput(
             label="通貨（省略時は国の通貨を自動）",
-            placeholder="空欄: /log_ct 設定国の通貨、未設定チャンネルは JPY",
+            placeholder="空欄: 国から推定、未設定なら JPY",
             required=False,
             max_length=10,
+        )
+        self.country = discord.ui.TextInput(
+            label="国（任意。/log_ct 設定時はその国を優先）",
+            default=country_default,
+            placeholder="例: タイ（未入力なら不明）",
+            required=False,
+            max_length=40,
         )
         self.recorded_at = discord.ui.TextInput(
             label="日時 (YYYY-MM-DD HH:MM)",
@@ -183,16 +241,17 @@ class EntryModal(discord.ui.Modal):
 
         self.add_item(self.amount)
         self.add_item(self.currency)
+        self.add_item(self.country)
         self.add_item(self.recorded_at)
         self.add_item(self.memo)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            amount_raw = self.amount.value.strip()
-            amount_local = float(amount_raw)
+            amount_local = _parse_amount(self.amount.value)
         except ValueError:
             await interaction.response.send_message(
-                f"金額は数字で入力してください（入力値: {self.amount.value}）", ephemeral=True
+                f"金額は数字で入力してください（小数点可。入力値: {self.amount.value}）",
+                ephemeral=True,
             )
             return
 
@@ -213,7 +272,7 @@ class EntryModal(discord.ui.Modal):
         try:
             # スレッド単位で国設定を参照（親チャンネルにはフォールバックしない）
             binding = await run_sync(st.get_channel_binding, channel_id)
-            country = (binding or {}).get("国") or DEFAULT_COUNTRY
+            country = _resolve_country(binding, self.country.value or "")
             currency = _resolve_currency(
                 country,
                 binding,
@@ -593,12 +652,16 @@ async def on_ready():
 
 @bot.tree.command(name="log_ex", description="支出を記録します")
 async def log_ex(interaction: discord.Interaction):
-    await interaction.response.send_modal(EntryModal("支出"))
+    await interaction.response.send_modal(
+        EntryModal("支出", channel_id=interaction.channel_id)
+    )
 
 
 @bot.tree.command(name="log_in", description="収入を記録します")
 async def log_in(interaction: discord.Interaction):
-    await interaction.response.send_modal(EntryModal("収入"))
+    await interaction.response.send_modal(
+        EntryModal("収入", channel_id=interaction.channel_id)
+    )
 
 
 @bot.tree.command(name="log_ct", description="このスレッド/チャンネルを国/地域に紐付けます")
@@ -759,9 +822,11 @@ def _format_currency_breakdown(by_currency: dict[str, dict[str, float]]) -> str:
         local = by_currency[cur]["local"]
         jpy = by_currency[cur]["jpy"]
         if cur == "JPY":
-            lines.append(f"**{cur}**: {local:,.0f}円")
+            lines.append(f"**{cur}**: {_format_amount(local)}円")
         else:
-            lines.append(f"**{cur}**: {local:,.0f} (約{jpy:,.0f}円)")
+            lines.append(
+                f"**{cur}**: {_format_amount(local)} (約{_format_amount(jpy)}円)"
+            )
     return "\n".join(lines)
 
 
@@ -969,9 +1034,11 @@ def _entry_detail_embed(entry: dict) -> discord.Embed:
     amount_local = entry.get("現地金額", "")
     amount_jpy = entry.get("円換算額", "")
     if currency != "JPY":
-        amount_text = f"{amount_local} {currency} → {amount_jpy}円"
+        amount_text = (
+            f"{_format_amount(amount_local)} {currency} → {_format_amount(amount_jpy)}円"
+        )
     else:
-        amount_text = f"{amount_jpy}円"
+        amount_text = f"{_format_amount(amount_jpy)}円"
     embed.add_field(name="金額", value=amount_text, inline=False)
     embed.add_field(name="タグ", value=str(entry.get("タグ") or "（なし）"), inline=True)
     embed.add_field(name="メモ", value=str(entry.get("メモ") or "（なし）"), inline=True)
@@ -1030,9 +1097,12 @@ async def _apply_field_update(
 
     if field in ("現地金額", "通貨"):
         try:
-            amount_local = float(value) if field == "現地金額" else float(target["現地金額"])
+            if field == "現地金額":
+                amount_local = _parse_amount(value)
+            else:
+                amount_local = _parse_amount(str(target["現地金額"]))
         except ValueError:
-            await reply("金額は数字で入力してください。", ephemeral=True)
+            await reply("金額は数字で入力してください（小数点可）。", ephemeral=True)
             return False
         currency = value.upper() if field == "通貨" else str(target["通貨"])
         try:
@@ -1044,7 +1114,10 @@ async def _apply_field_update(
         await run_sync(st.update_field, entry_id, "通貨", currency)
         await run_sync(st.update_field, entry_id, "レート", str(rate))
         await run_sync(st.update_field, entry_id, "円換算額", str(amount_jpy))
-        await reply(f"✅ ID {entry_id} を更新しました: {amount_local} {currency} → {amount_jpy:,.0f}円")
+        await reply(
+            f"✅ ID {entry_id} を更新しました: "
+            f"{_format_amount(amount_local)} {currency} → {_format_amount(amount_jpy)}円"
+        )
         return True
 
     if field == "割り勘":
