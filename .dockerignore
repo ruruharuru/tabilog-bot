@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.example
+.venv
+venv
+__pycache__
+*.pyc
+*.md
+docs
+service_account.json
+tabilog-*.json
+.DS_Store

@@ -89,19 +89,36 @@ Discordの任意のテキストチャンネルで:
 
 と打つとモーダル（入力フォーム）が開くので、金額や通貨を入力して送信してみてください。
 
-## 3. 常時稼働（Railwayへのデプロイ）
+## 3. 常時稼働（Northflankへのデプロイ）
 
-ローカルでの動作確認ができたら、常時稼働用にRailway等へデプロイします。
+ローカルでの動作確認ができたら、常時稼働用に [Northflank](https://northflank.com) へデプロイします。  
+無料の **Developer Sandbox** で、スリープなしの常時稼働ができます（サービス2つまで）。
 
-1. このフォルダをGitHubリポジトリにpush（`.env` は `.gitignore` で除外されるので安全です）
-2. [Railway](https://railway.app) にログイン →「New Project」→「Deploy from GitHub repo」→ このリポジトリを選択
-3. Railwayのプロジェクト設定 →「Variables」タブで、`.env` に書いた環境変数を登録
+> Railway と同時に起動すると Bot が二重起動します。Northflank 側でオンラインを確認したら、Railway のサービスは停止してください。
+
+1. このフォルダを GitHub リポジトリに push（`.env` は `.gitignore` で除外されるので安全です）
+2. [Northflank](https://app.northflank.com/signup) に GitHub で登録する
+   - プランは **Developer Sandbox** を選ぶ
+   - カード登録を求められることがあるが、Sandbox のままなら通常は課金されない（料金画面は時々確認する）
+3. **Create New → Project** でプロジェクトを作る（リージョンは US / UK どちらでも可）
+4. **Create New → Service → Combined** を選ぶ
+   - Repository: このリポジトリ / ブランチ `main`
+   - Build: **Dockerfile**（リポジトリ直下の `Dockerfile` が自動検出される）
+   - Networking: **ポートは追加しない**（Discord Bot に公開 URL は不要）
+   - Resources: Sandbox なら **nf-compute-20**（512MB）を推奨
+5. Runtime variables に `.env` と同じ環境変数を登録する
    - `DISCORD_BOT_TOKEN`
-   - `GOOGLE_SERVICE_ACCOUNT_JSON`
+   - `GOOGLE_SERVICE_ACCOUNT_JSON`（JSON を1行のまま貼る。Northflank は JSON 値に対応）
    - `GOOGLE_SHEET_ID`
    - （任意）`DEFAULT_SPLIT_PARTICIPANT_IDS`
-4. 「Settings」→「Start Command」に `python bot.py` を設定（自動検出されない場合）
-5. デプロイが完了すると、Discord上でbotが常時「オンライン」になります
+6. Create Service → ビルド〜起動まで数分待つ
+7. サービスログに `Logged in as ...` が出て、Discord 上で Bot が「オンライン」になれば完了
+
+### うまくいかないとき
+
+- **ビルドは成功するがすぐ落ちる**: Runtime variables が足りないか、値の引用符が余分。ログの `DISCORD_BOT_TOKEN` / Sheets 関連エラーを確認
+- **カード認証で止まる**: Sandbox でも初回はカード確認がある。プリペイドは通らないことがある
+- **無料枠を超えて課金されそう**: サービスは1つ、プランは Developer Sandbox、インスタンス数は1のままにする
 
 ## トラブルシューティング
 
