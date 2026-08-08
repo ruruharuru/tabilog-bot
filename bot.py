@@ -105,15 +105,20 @@ def _resolve_currency(
     binding: dict | None,
     manual_input: str,
 ) -> str:
-    """手入力 > Channels保存通貨 > 国名推定 > JPY の順で通貨を決める。"""
-    manual = manual_input.strip().upper()
+    """手入力 > /log_ct の保存通貨 > /log_ct の国名推定 > JPY。
+
+    ct 未設定かつ通貨未入力なら、フォームの国名があっても換算せず JPY。
+    """
+    manual = (manual_input or "").strip().upper()
     if manual:
         return manual
-    if binding:
-        stored = str(binding.get("通貨", "")).strip().upper()
-        if stored:
-            return stored
-    return countries.get_currency_for_country(country) or "JPY"
+    if not binding:
+        return "JPY"
+    stored = str(binding.get("通貨", "")).strip().upper()
+    if stored:
+        return stored
+    ct_country = str(binding.get("国", "")).strip() or country
+    return countries.get_currency_for_country(ct_country) or "JPY"
 
 
 def _parse_amount(value: str) -> float:
@@ -216,8 +221,8 @@ class EntryModal(discord.ui.Modal):
             max_length=20,
         )
         self.currency = discord.ui.TextInput(
-            label="通貨（省略時は国の通貨を自動）",
-            placeholder="空欄: 国から推定、未設定なら JPY",
+            label="通貨（省略時は /log_ct の通貨）",
+            placeholder="空欄: ct設定の通貨、未設定なら円",
             required=False,
             max_length=10,
         )
