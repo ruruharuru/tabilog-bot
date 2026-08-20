@@ -1,9 +1,10 @@
 """
 Google Sheets 操作モジュール
-2つのタブを使う:
+使うタブ:
   - "Log"      : 収支の記録本体
   - "Channels" : チャンネルID <-> 国 の紐付け
   - "Tags"     : 選択用タグ一覧
+  - "Memos"    : ユーザー固有の買い物メモ
 存在しない場合は自動で作成する。
 
 【重要】DiscordのIDは18〜19桁なので、Sheetsには必ずRAW文字列として書き込む。
@@ -30,8 +31,13 @@ LOG_HEADERS = [
 ]
 CHANNEL_HEADERS = ["チャンネルID", "国", "通貨"]
 TAG_HEADERS = ["タグ"]
+MEMO_HEADERS = [
+    "ID", "日時", "ユーザーID", "国",
+    "現地金額", "通貨", "レート", "円換算額", "メモ", "集計対象",
+]
 
 ID_LIKE_FIELDS = {"チャンネルID", "支払者ID", "参加者ID"}
+MEMO_ID_LIKE_FIELDS = {"ユーザーID"}
 
 
 def _get_client():
@@ -63,9 +69,10 @@ def _normalize_channel_id(value) -> str:
     return text
 
 
-def _id_column_indexes(headers: list[str]) -> list[int]:
+def _id_column_indexes(headers: list[str], fields: set[str] | None = None) -> list[int]:
     """gspreadのnumericiseがカンマを千位区切りとして消すのを避ける列番号(1始まり)。"""
-    return [headers.index(name) + 1 for name in ID_LIKE_FIELDS if name in headers]
+    target = fields if fields is not None else ID_LIKE_FIELDS
+    return [headers.index(name) + 1 for name in target if name in headers]
 
 
 class SheetStore:
@@ -76,8 +83,10 @@ class SheetStore:
         self.log_ws = self._get_or_create_ws("Log", LOG_HEADERS)
         self.channel_ws = self._get_or_create_ws("Channels", CHANNEL_HEADERS)
         self.tag_ws = self._get_or_create_ws("Tags", TAG_HEADERS)
+        self.memo_ws = self._get_or_create_ws("Memos", MEMO_HEADERS)
         self._ensure_log_headers()
         self._ensure_channel_headers()
+        self._ensure_memo_headers()
         self._ensure_default_tags()
 
     def _ensure_channel_headers(self):
@@ -100,6 +109,16 @@ class SheetStore:
         if missing:
             self.log_ws.update([first_row + missing], "A1", raw=True)
 
+    def _ensure_memo_headers(self):
+        """既存Memosシートに新列が無ければヘッダーを拡張する。"""
+        first_row = self.memo_ws.row_values(1)
+        if not first_row:
+            self.memo_ws.append_row(MEMO_HEADERS, value_input_option="RAW")
+            return
+        missing = [h for h in MEMO_HEADERS if h not in first_row]
+        if missing:
+            self.memo_ws.update([first_row + missing], "A1", raw=True)
+
     def _get_or_create_ws(self, title, headers):
         try:
             ws = self.ss.worksheet(title)
@@ -117,7 +136,7 @@ class SheetStore:
         """Tagsシートが空ならよく使うタグを初期投入する。"""
         if self.list_tags():
             return
-        defaults = ["飯", "移動", "宿", "観光", "買い物", "その他"]
+        defaults = ["飯", "移動", "宿", "観光", "買い物", "両替", "その他"]
         rows = [[t] for t in defaults]
         self.tag_ws.append_rows(rows, value_input_option="RAW")
 
@@ -182,7 +201,7 @@ class SheetStore:
 
     def add_entry(
         self,
-        entry_type: str,  # "支出" or "収入"
+        entry_type: str,  # "支出" or "予算"（旧データは「収入」もあり得る）
         channel_id: str,
         country: str,
         amount_local: float,
@@ -286,3 +305,89 @@ class SheetStore:
                 self.tag_ws.delete_rows(i)
                 return True
         return False
+
+    # ---------- Personal shopping memos ----------
+
+    def _next_memo_id(self) -> int:
+        ids = self.memo_ws.col_values(1)[1:]
+        nums = [int(x) for x in ids if str(x).isdigit()]
+        return max(nums, default=0) + 1
+
+    def add_memo(
+        self,
+        user_id: str,
+        country: str,
+        amount_local: float,
+        currency: str,
+        rate: float,
+        amount_jpy: float,
+        memo: str,
+        recorded_at: str | None = None,
+        include_in_sum: bool = False,
+    ) -> int:
+        new_id = self._next_memo_id()
+        now = recorded_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        row = [
+            new_id,
+            now,
+            str(user_id),
+            country,
+            amount_local,
+            currency.upper(),
+            rate,
+            amount_jpy,
+            memo,
+            "ON" if include_in_sum else "OFF",
+        ]
+        self.memo_ws.append_row(row, value_input_option="RAW")
+        return new_id
+
+    def get_all_memos(self) -> list[dict]:
+        records = self.memo_ws.get_all_records(
+            numericise_ignore=_id_column_indexes(MEMO_HEADERS, MEMO_ID_LIKE_FIELDS)
+        )
+        for row in records:
+            row["ユーザーID"] = _clean_id_text(row.get("ユーザーID", ""))
+            if "集計対象" not in row or str(row.get("集計対象", "")).strip() == "":
+                row["集計対象"] = "OFF"
+            try:
+                row["円換算額"] = float(row.get("円換算額") or 0)
+            except (TypeError, ValueError):
+                row["円換算額"] = 0.0
+        return records
+
+    def get_memos_for_user(self, user_id: str) -> list[dict]:
+        target = _clean_id_text(user_id)
+        return [m for m in self.get_all_memos() if m.get("ユーザーID") == target]
+
+    def find_memo_row_by_id(self, memo_id: int) -> int | None:
+        ids = self.memo_ws.col_values(1)[1:]
+        for i, v in enumerate(ids, start=2):
+            if str(v) == str(memo_id):
+                return i
+        return None
+
+    def get_memo_by_id(self, memo_id: int) -> dict | None:
+        for memo in self.get_all_memos():
+            if str(memo.get("ID")) == str(memo_id):
+                return memo
+        return None
+
+    def update_memo_field(self, memo_id: int, field: str, value) -> bool:
+        row_idx = self.find_memo_row_by_id(memo_id)
+        if row_idx is None:
+            return False
+        if field not in MEMO_HEADERS:
+            return False
+        col_idx = MEMO_HEADERS.index(field) + 1
+        write_value = str(value) if field in MEMO_ID_LIKE_FIELDS else value
+        cell = gspread.utils.rowcol_to_a1(row_idx, col_idx)
+        self.memo_ws.update([[write_value]], range_name=cell, raw=True)
+        return True
+
+    def delete_memo(self, memo_id: int) -> bool:
+        row_idx = self.find_memo_row_by_id(memo_id)
+        if row_idx is None:
+            return False
+        self.memo_ws.delete_rows(row_idx)
+        return True

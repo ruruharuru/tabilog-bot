@@ -3,7 +3,10 @@ TabiLog Bot - 世界一周の費用ログ用Discord Bot
 
 コマンド一覧:
   /log_ex      支出を記録（金額入力→タグ/割り勘を1画面で選択）
-  /log_in      収入を記録（金額入力→タグを1画面で選択）
+  /log_in      予算を記録（金額入力→タグを1画面で選択）
+  /log_memo    自分用の買い物メモを記録
+  /log_memo_ls 自分の買い物メモ一覧（自分だけに表示）
+  /log_memo_rm 自分の買い物メモを削除
   /log_ct      このスレッド/チャンネルを国に紐付け
   /log_tag_add タグを登録
   /log_tag_rm  タグを削除
@@ -20,6 +23,7 @@ import datetime
 import os
 import re
 import logging
+import unicodedata
 from collections import defaultdict
 
 import discord
@@ -37,6 +41,12 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tabilog")
 
 DEFAULT_COUNTRY = "不明"  # 国が紐付いていないチャンネル用のデフォルト
+# /log_sum で国指定時、このタグ付き記録は集計から除外（tag=両替 の明示指定時は除外しない）
+SUM_COUNTRY_EXCLUDE_TAG = "両替"
+# 種別「予算」。旧データ互換のため「収入」も予算として扱う
+ENTRY_TYPE_EXPENSE = "支出"
+ENTRY_TYPE_BUDGET = "予算"
+ENTRY_TYPE_BUDGET_ALIASES = frozenset({ENTRY_TYPE_BUDGET, "収入"})
 DISCORD_ID_RE = re.compile(r"\d{17,20}")
 MENTION_RE = re.compile(r"<@!?(\d{17,20})>")
 
@@ -87,6 +97,61 @@ def get_store() -> SheetStore:
 async def run_sync(func, *args, **kwargs):
     """同期のSheets/HTTP呼び出しをスレッドに逃がし、イベントループを塞がない。"""
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+async def aget_store() -> SheetStore:
+    """Sheets 初期化をスレッドで行い、イベントループを塞がない。"""
+    return await run_sync(get_store)
+
+
+async def sheets(method_name: str, *args, **kwargs):
+    """SheetStore の同期メソッドをスレッド上で呼ぶ。"""
+
+    def _call():
+        return getattr(get_store(), method_name)(*args, **kwargs)
+
+    return await run_sync(_call)
+
+
+async def _safe_defer(
+    interaction: discord.Interaction, *, ephemeral: bool = False
+) -> bool:
+    """defer する。期限切れ・二重応答なら False（呼び出し側は処理を中断）。"""
+    if interaction.response.is_done():
+        return True
+    try:
+        await interaction.response.defer(ephemeral=ephemeral)
+        return True
+    except discord.NotFound:
+        log.warning("interaction expired before defer (event loop blocked or too slow)")
+        return False
+    except discord.HTTPException as e:
+        # 40060: Interaction has already been acknowledged
+        if getattr(e, "code", None) == 40060:
+            log.warning(
+                "interaction already acknowledged "
+                "(duplicate bot, double-click, or delayed handler)"
+            )
+            return False
+        raise
+
+
+async def _prefetch_country_default(channel_id: int | str | None) -> str:
+    """モーダル用の国デフォルトを非同期取得（失敗・遅延時は不明）。"""
+    if channel_id is None:
+        return DEFAULT_COUNTRY
+    try:
+        binding = await asyncio.wait_for(
+            sheets("get_channel_binding", channel_id),
+            timeout=1.5,
+        )
+        if binding and str(binding.get("国", "")).strip():
+            return str(binding["国"]).strip()
+    except asyncio.TimeoutError:
+        log.warning("prefetch channel country timed out; using default")
+    except Exception:
+        log.exception("failed to prefetch channel country")
+    return DEFAULT_COUNTRY
 
 
 def _valid_discord_id(value) -> str | None:
@@ -168,9 +233,9 @@ def _entry_embed(
 ) -> discord.Embed:
     embed = discord.Embed(
         title=f"✅ 記録しました (ID: {entry_id})",
-        color=discord.Color.green() if entry_type == "収入" else discord.Color.orange(),
+        color=discord.Color.green() if entry_type in ENTRY_TYPE_BUDGET_ALIASES else discord.Color.orange(),
     )
-    embed.add_field(name="種別", value=entry_type, inline=True)
+    embed.add_field(name="種別", value=_display_entry_type(entry_type), inline=True)
     embed.add_field(name="国", value=country, inline=True)
     if currency != "JPY":
         embed.add_field(
@@ -196,23 +261,15 @@ def _entry_embed(
 
 
 # ---------------------------------------------------------------------------
-# 支出/収入 記録用モーダル → オプションを1画面でまとめて選択
+# 支出/予算 記録用モーダル → オプションを1画面でまとめて選択
 # ---------------------------------------------------------------------------
 
 class EntryModal(discord.ui.Modal):
-    def __init__(self, entry_type: str, channel_id: int | str | None = None):
+    def __init__(self, entry_type: str, country_default: str = DEFAULT_COUNTRY):
         super().__init__(title=f"{entry_type}を記録")
         self.entry_type = entry_type
 
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        country_default = DEFAULT_COUNTRY
-        if channel_id is not None:
-            try:
-                binding = get_store().get_channel_binding(channel_id)
-                if binding and str(binding.get("国", "")).strip():
-                    country_default = str(binding["国"]).strip()
-            except Exception:
-                log.exception("failed to prefetch channel country for modal")
 
         self.amount = discord.ui.TextInput(
             label="金額",
@@ -355,6 +412,200 @@ class EntryModal(discord.ui.Modal):
                 tags=tags,
                 default_participant_ids=default_participant_ids,
             ),
+        )
+
+
+class MemoModal(discord.ui.Modal):
+    """ユーザー固有の買い物メモ（共有ログとは別管理）。"""
+
+    def __init__(self, country_default: str = DEFAULT_COUNTRY):
+        super().__init__(title="買い物メモを記録")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.amount = discord.ui.TextInput(
+            label="金額",
+            placeholder="例: 250 または 12.5",
+            required=True,
+            max_length=20,
+        )
+        self.currency = discord.ui.TextInput(
+            label="通貨（省略時は /log_ct の通貨）",
+            placeholder="空欄: ct設定の通貨、未設定なら円",
+            required=False,
+            max_length=10,
+        )
+        self.country = discord.ui.TextInput(
+            label="国（任意。/log_ct 設定時はその国を優先）",
+            default=country_default,
+            placeholder="例: タイ（未入力なら不明）",
+            required=False,
+            max_length=40,
+        )
+        self.recorded_at = discord.ui.TextInput(
+            label="日時 (YYYY-MM-DD HH:MM)",
+            default=now,
+            placeholder="例: 2026-07-25 18:30",
+            required=True,
+            max_length=19,
+        )
+        self.memo = discord.ui.TextInput(
+            label="メモ",
+            placeholder="例: お土産候補",
+            required=False,
+            max_length=200,
+        )
+        self.add_item(self.amount)
+        self.add_item(self.currency)
+        self.add_item(self.country)
+        self.add_item(self.recorded_at)
+        self.add_item(self.memo)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            amount_local = _parse_amount(self.amount.value)
+        except ValueError:
+            await interaction.response.send_message(
+                f"金額は数字で入力してください（小数点可。入力値: {self.amount.value}）",
+                ephemeral=True,
+            )
+            return
+
+        recorded_at = _parse_datetime(self.recorded_at.value)
+        if not recorded_at:
+            await interaction.response.send_message(
+                "日時は `YYYY-MM-DD HH:MM` 形式で指定してください（例: `2026-07-25 18:30`）。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        st = get_store()
+        channel_id = str(interaction.channel_id)
+        try:
+            binding = await run_sync(st.get_channel_binding, channel_id)
+            country = _resolve_country(binding, self.country.value or "")
+            currency = _resolve_currency(
+                country,
+                binding,
+                self.currency.value or "",
+            )
+            amount_jpy, rate = await run_sync(fx.convert_to_jpy, amount_local, currency)
+            memo_id = await run_sync(
+                st.add_memo,
+                user_id=str(interaction.user.id),
+                country=country,
+                amount_local=amount_local,
+                currency=currency,
+                rate=rate,
+                amount_jpy=amount_jpy,
+                memo=(self.memo.value or "").strip(),
+                recorded_at=recorded_at,
+                include_in_sum=False,
+            )
+        except Exception as e:
+            log.exception("memo submit failed")
+            await interaction.followup.send(
+                f"メモの保存に失敗しました: {e}",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"📝 買い物メモを保存しました (ID: {memo_id})",
+            color=discord.Color.teal(),
+        )
+        embed.add_field(name="日時", value=recorded_at, inline=True)
+        embed.add_field(name="国", value=country, inline=True)
+        if currency != "JPY":
+            amount_text = (
+                f"{_format_amount(amount_local)} {currency} → "
+                f"約{_format_amount(amount_jpy)}円"
+            )
+        else:
+            amount_text = f"{_format_amount(amount_jpy)}円"
+        embed.add_field(name="金額", value=amount_text, inline=False)
+        note = (self.memo.value or "").strip()
+        if note:
+            embed.add_field(name="メモ", value=note, inline=False)
+        embed.add_field(name="集計対象", value="OFF（デフォルト）", inline=True)
+        embed.set_footer(text="共有ログには入りません。下で集計対象を切り替えられます。")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(
+            content=(
+                f"ID {memo_id}: 集計に入れたい場合は「集計対象」を ON にしてから確定してください。"
+            ),
+            view=MemoOptionsView(memo_id=memo_id, owner_id=str(interaction.user.id)),
+            ephemeral=True,
+        )
+
+
+class MemoOptionsView(discord.ui.View):
+    """買い物メモの集計対象を選んで確定する。"""
+
+    def __init__(self, memo_id: int, owner_id: str):
+        super().__init__(timeout=300)
+        self.memo_id = memo_id
+        self.owner_id = owner_id
+        self.include_in_sum = False
+        self._build_items()
+
+    def _build_items(self):
+        self.clear_items()
+        btn_toggle = discord.ui.Button(
+            label=f"集計対象: {'ON' if self.include_in_sum else 'OFF'}",
+            style=(
+                discord.ButtonStyle.success
+                if self.include_in_sum
+                else discord.ButtonStyle.danger
+            ),
+            custom_id="memo_toggle_include_sum",
+            row=0,
+        )
+        btn_toggle.callback = self.toggle_include_sum
+        self.add_item(btn_toggle)
+
+        btn_confirm = discord.ui.Button(
+            label="確定",
+            style=discord.ButtonStyle.primary,
+            custom_id="memo_confirm",
+            row=0,
+        )
+        btn_confirm.callback = self.confirm
+        self.add_item(btn_confirm)
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message(
+                "このメモの操作は本人だけできます。", ephemeral=True
+            )
+            return False
+        return True
+
+    async def toggle_include_sum(self, interaction: discord.Interaction):
+        if not await self._ensure_owner(interaction):
+            return
+        self.include_in_sum = not self.include_in_sum
+        self._build_items()
+        await interaction.response.edit_message(view=self)
+
+    async def confirm(self, interaction: discord.Interaction):
+        if not await self._ensure_owner(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        include_in_sum = self.include_in_sum
+        ok = await run_sync(
+            get_store().update_memo_field,
+            self.memo_id,
+            "集計対象",
+            "ON" if include_in_sum else "OFF",
+        )
+        if not ok:
+            await interaction.followup.send("メモの更新に失敗しました。", ephemeral=True)
+            return
+        self.stop()
+        status = "ON" if include_in_sum else "OFF"
+        await interaction.edit_original_response(
+            content=f"✅ メモ ID {self.memo_id} を確定しました（集計対象: {status}）。",
+            view=None,
         )
 
 
@@ -657,15 +908,17 @@ async def on_ready():
 
 @bot.tree.command(name="log_ex", description="支出を記録します")
 async def log_ex(interaction: discord.Interaction):
+    country_default = await _prefetch_country_default(interaction.channel_id)
     await interaction.response.send_modal(
-        EntryModal("支出", channel_id=interaction.channel_id)
+        EntryModal(ENTRY_TYPE_EXPENSE, country_default=country_default)
     )
 
 
-@bot.tree.command(name="log_in", description="収入を記録します")
+@bot.tree.command(name="log_in", description="予算を記録します")
 async def log_in(interaction: discord.Interaction):
+    country_default = await _prefetch_country_default(interaction.channel_id)
     await interaction.response.send_modal(
-        EntryModal("収入", channel_id=interaction.channel_id)
+        EntryModal(ENTRY_TYPE_BUDGET, country_default=country_default)
     )
 
 
@@ -734,6 +987,95 @@ async def log_tag_ls(interaction: discord.Interaction):
     await interaction.followup.send("🏷 登録タグ: " + ", ".join(f"`{t}`" for t in tags))
 
 
+@bot.tree.command(name="log_memo", description="自分用の買い物メモを記録します（共有ログには入りません）")
+async def log_memo(interaction: discord.Interaction):
+    country_default = await _prefetch_country_default(interaction.channel_id)
+    await interaction.response.send_modal(MemoModal(country_default=country_default))
+
+
+@bot.tree.command(name="log_memo_ls", description="自分の買い物メモ一覧を表示します（自分だけに表示）")
+@app_commands.describe(country="絞り込む国（省略可）")
+async def log_memo_ls(interaction: discord.Interaction, country: str | None = None):
+    await interaction.response.defer(ephemeral=True)
+    memos = await run_sync(get_store().get_memos_for_user, str(interaction.user.id))
+    filtered = [m for m in memos if _match_memo(m, country)]
+    if not filtered:
+        await interaction.followup.send("買い物メモがありません。", ephemeral=True)
+        return
+
+    lines = []
+    for m in filtered[-30:]:
+        note = str(m.get("メモ") or "").strip()
+        cur = str(m.get("通貨") or "JPY").upper()
+        local = m.get("現地金額", "")
+        jpy = float(m.get("円換算額") or 0)
+        if cur != "JPY":
+            amount = f"{_format_amount(local)} {cur}（{_format_amount(jpy)}円）"
+        else:
+            amount = f"{_format_amount(jpy)}円"
+        line = (
+            f"**[{m['ID']}]** {m.get('日時','')} {amount} {m.get('国','')}"
+            f" [集計:{str(m.get('集計対象') or 'OFF').upper()}]"
+        )
+        if note:
+            line += f" {note}"
+        lines.append(line)
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[-4000:]
+    total_all = _memo_jpy_total(filtered)
+    total_on = _memo_jpy_total(filtered, require_include=True)
+    embed = discord.Embed(
+        title="📝 自分の買い物メモ",
+        description=text,
+        color=discord.Color.teal(),
+    )
+    embed.add_field(name="合計（全件）", value=f"{total_all:,.0f}円", inline=True)
+    embed.add_field(name="合計（集計対象ON）", value=f"{total_on:,.0f}円", inline=True)
+    embed.add_field(name="件数", value=f"{len(filtered)}件", inline=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="log_memo_rm", description="自分の買い物メモを削除します")
+@app_commands.describe(memo_ids="削除するメモID（カンマ区切り可）")
+async def log_memo_rm(interaction: discord.Interaction, memo_ids: str):
+    await interaction.response.defer(ephemeral=True)
+    raw_ids = [t.strip() for t in re.split(r"[\s,、]+", memo_ids) if t.strip()]
+    if not raw_ids:
+        await interaction.followup.send("削除するメモIDを指定してください。", ephemeral=True)
+        return
+
+    st = get_store()
+    user_id = str(interaction.user.id)
+    deleted = []
+    skipped = []
+    for token in raw_ids:
+        if not token.isdigit():
+            skipped.append(token)
+            continue
+        memo_id = int(token)
+        memo = await run_sync(st.get_memo_by_id, memo_id)
+        if memo is None:
+            skipped.append(token)
+            continue
+        if str(memo.get("ユーザーID")) != user_id:
+            skipped.append(token)
+            continue
+        ok = await run_sync(st.delete_memo, memo_id)
+        if ok:
+            deleted.append(str(memo_id))
+        else:
+            skipped.append(token)
+
+    parts = []
+    if deleted:
+        parts.append(f"🗑️ 削除しました: ID {', '.join(deleted)}")
+    if skipped:
+        parts.append(f"スキップ: {', '.join(skipped)}（存在しない／他人のメモ／不正なID）")
+    await interaction.followup.send("\n".join(parts) or "削除対象がありませんでした。", ephemeral=True)
+
+
 def _split_summary(entry: dict, *, name_of=None) -> str:
     """割り勘対象の記録なら、支払者・参加者を短い文字列にして返す（対象外なら空文字）。
 
@@ -793,10 +1135,103 @@ def _match_entry(entry: dict, country: str | None, tag: str | None) -> bool:
     if country and entry.get("国") != country:
         return False
     if tag:
-        entry_tags = [t.strip() for t in str(entry.get("タグ", "")).split(",") if t.strip()]
+        entry_tags = _entry_tag_list(entry)
         if tag not in entry_tags:
             return False
     return True
+
+
+def _entry_tag_list(entry: dict) -> list[str]:
+    """タグ列を分割（カンマ・読点・空白区切りに対応）。"""
+    raw = unicodedata.normalize("NFKC", str(entry.get("タグ", "") or ""))
+    return [p.strip() for p in re.split(r"[,、/\s|]+", raw) if p.strip()]
+
+
+def _entry_has_tag(entry: dict, tag: str) -> bool:
+    target = unicodedata.normalize("NFKC", str(tag)).strip()
+    if not target:
+        return False
+    return any(
+        unicodedata.normalize("NFKC", t).strip() == target
+        for t in _entry_tag_list(entry)
+    )
+
+
+def _should_exclude_exchange_tag(country: str | None, tag: str | None) -> bool:
+    """国指定かつ tag=両替 の明示指定でないとき、両替タグを除外する。"""
+    if not country:
+        return False
+    explicit = unicodedata.normalize("NFKC", str(tag or "")).strip()
+    return explicit != SUM_COUNTRY_EXCLUDE_TAG
+
+
+def _match_memo(memo: dict, country: str | None) -> bool:
+    if country and str(memo.get("国", "")).strip() != country:
+        return False
+    return True
+
+
+def _is_memo_included_in_sum(memo: dict) -> bool:
+    return str(memo.get("集計対象", "OFF")).strip().upper() == "ON"
+
+
+def _memo_jpy_total(
+    memos: list[dict],
+    country: str | None = None,
+    *,
+    require_include: bool = False,
+) -> float:
+    total = 0.0
+    for memo in memos:
+        if not _match_memo(memo, country):
+            continue
+        if require_include and not _is_memo_included_in_sum(memo):
+            continue
+        try:
+            total += float(memo.get("円換算額") or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _memo_totals_by_user(
+    memos: list[dict],
+    *,
+    require_include: bool = False,
+) -> dict[str, float]:
+    by_user: dict[str, float] = defaultdict(float)
+    for memo in memos:
+        if require_include and not _is_memo_included_in_sum(memo):
+            continue
+        uid = _valid_discord_id(memo.get("ユーザーID", ""))
+        if not uid:
+            continue
+        try:
+            by_user[uid] += float(memo.get("円換算額") or 0)
+        except (TypeError, ValueError):
+            continue
+    return dict(by_user)
+
+
+def _is_expense_entry(entry: dict) -> bool:
+    return str(entry.get("種別", "")).strip() == ENTRY_TYPE_EXPENSE
+
+
+def _is_budget_entry(entry: dict) -> bool:
+    """予算（旧「収入」含む）。"""
+    return str(entry.get("種別", "")).strip() in ENTRY_TYPE_BUDGET_ALIASES
+
+
+def _display_entry_type(entry_type: str) -> str:
+    """表示用。旧データの「収入」も「予算」と出す。"""
+    text = str(entry_type or "").strip()
+    if text in ENTRY_TYPE_BUDGET_ALIASES:
+        return ENTRY_TYPE_BUDGET
+    return text or "-"
+
+
+def _entry_sign(entry: dict) -> str:
+    return "-" if _is_expense_entry(entry) else "+"
 
 
 def _is_included_in_sum(entry: dict) -> bool:
@@ -838,16 +1273,48 @@ def _format_currency_breakdown(by_currency: dict[str, dict[str, float]]) -> str:
 @bot.tree.command(name="log_sum", description="国・タグで絞り込んで集計します（自分だけに表示）")
 @app_commands.describe(country="絞り込む国（省略可）", tag="絞り込むタグ（省略可）")
 async def log_sum(interaction: discord.Interaction, country: str | None = None, tag: str | None = None):
-    await interaction.response.defer(ephemeral=True)
-    entries = await run_sync(get_store().get_all_entries)
+    if not await _safe_defer(interaction, ephemeral=True):
+        return
+    entries = await sheets("get_all_entries")
     has_filter = bool(country or tag)
     filtered = [
         e for e in entries
         if _match_entry(e, country, tag)
         and (has_filter or _is_included_in_sum(e))
     ]
+    # 国指定時は「両替」タグを除外（ただし tag=両替 で明示指定したときは残す）
+    excluded_exchange = 0
+    if _should_exclude_exchange_tag(country, tag):
+        kept = []
+        for e in filtered:
+            if _entry_has_tag(e, SUM_COUNTRY_EXCLUDE_TAG):
+                excluded_exchange += 1
+                continue
+            kept.append(e)
+        filtered = kept
+        log.info(
+            "log_sum country=%r excluded tag=%r count=%s remaining=%s",
+            country,
+            SUM_COUNTRY_EXCLUDE_TAG,
+            excluded_exchange,
+            len(filtered),
+        )
 
-    if not filtered:
+    my_memos = await sheets("get_memos_for_user", str(interaction.user.id))
+    # タグ絞り込み時はメモにタグが無いので加算しない。
+    # 国指定時は同じ国のメモ（集計対象OFF含む）。未指定時は集計対象ONのみ。
+    if tag:
+        memo_total = 0.0
+        memo_note = "タグ指定時は買い物メモを加算しません"
+    else:
+        memo_total = _memo_jpy_total(
+            my_memos,
+            country,
+            require_include=not bool(country),
+        )
+        memo_note = None
+
+    if not filtered and memo_total <= 0:
         if has_filter:
             await interaction.followup.send("該当する記録がありませんでした。", ephemeral=True)
         else:
@@ -857,11 +1324,12 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
             )
         return
 
-    expense_entries = [e for e in filtered if e["種別"] == "支出"]
-    income_entries = [e for e in filtered if e["種別"] == "収入"]
+    expense_entries = [e for e in filtered if _is_expense_entry(e)]
+    budget_entries = [e for e in filtered if _is_budget_entry(e)]
     total_expense = sum(e["円換算額"] for e in expense_entries)
-    total_income = sum(e["円換算額"] for e in income_entries)
-    balance = total_income - total_expense
+    total_budget = sum(e["円換算額"] for e in budget_entries)
+    balance = total_budget - total_expense
+    expense_with_memo = total_expense + memo_total
 
     title_parts = []
     if country:
@@ -871,23 +1339,25 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
     title = " / ".join(title_parts) if title_parts else "全期間"
 
     embed = discord.Embed(title=f"📊 集計: {title}", color=discord.Color.blue())
-    embed.add_field(name="支出合計（円）", value=f"{total_expense:,.0f}円", inline=True)
-    embed.add_field(name="収入合計（円）", value=f"{total_income:,.0f}円", inline=True)
-    embed.add_field(name="残高（収入 − 支出）", value=f"{balance:,.0f}円", inline=True)
+    embed.add_field(
+        name="支出合計（円）",
+        value=f"{total_expense:,.0f}円（メモ込み: {expense_with_memo:,.0f}円）",
+        inline=True,
+    )
+    embed.add_field(name="残高（予算 − 支出）", value=f"{balance:,.0f}円", inline=True)
     embed.add_field(name="件数", value=f"{len(filtered)}件", inline=True)
+    if memo_total > 0:
+        embed.add_field(
+            name="自分の買い物メモ",
+            value=f"{memo_total:,.0f}円",
+            inline=True,
+        )
 
     expense_by_currency = _currency_totals(expense_entries)
-    income_by_currency = _currency_totals(income_entries)
     if expense_by_currency:
         embed.add_field(
             name="支出（通貨別）",
             value=_format_currency_breakdown(expense_by_currency),
-            inline=False,
-        )
-    if income_by_currency:
-        embed.add_field(
-            name="収入（通貨別）",
-            value=_format_currency_breakdown(income_by_currency),
             inline=False,
         )
 
@@ -898,50 +1368,117 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
     )
     lines = []
     for e in recent:
-        sign = "-" if e["種別"] == "支出" else "+"
+        sign = _entry_sign(e)
         line = f"[{e['ID']}] {sign}{e['円換算額']:,.0f}円 {e.get('タグ','')} {e.get('メモ','')}"
         line += _split_summary(e, name_of=name_of)
         lines.append(line)
     if lines:
         embed.add_field(name="直近の記録", value="\n".join(lines), inline=False)
 
-    if has_filter:
-        embed.set_footer(text="国・タグ指定時は集計対象OFFの記録も含みます")
+    footer_parts = []
+    if country:
+        footer_parts.append("国指定は現金利用の参考値（集計対象OFF含む・公式集計は /log_all）")
+    elif has_filter:
+        footer_parts.append("タグ指定時は集計対象OFFの記録も含みます")
+    if _should_exclude_exchange_tag(country, tag):
+        footer_parts.append(
+            f"タグ「{SUM_COUNTRY_EXCLUDE_TAG}」を{excluded_exchange}件除外"
+        )
+    if memo_note:
+        footer_parts.append(memo_note)
+    if footer_parts:
+        embed.set_footer(text=" / ".join(footer_parts))
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="log_all", description="全体サマリー（国別内訳つき）")
+@bot.tree.command(name="log_all", description="全体サマリー（MEMO抜き / ユーザー別メモ / 自分のメモ込）")
 async def log_all(interaction: discord.Interaction):
     await interaction.response.defer()
-    entries = await run_sync(get_store().get_all_entries)
-    if not entries:
+    st = get_store()
+    entries = await run_sync(st.get_all_entries)
+    all_memos = await run_sync(st.get_all_memos)
+    aggregated = [e for e in entries if _is_included_in_sum(e)]
+
+    if not aggregated and not all_memos:
         await interaction.followup.send("記録がまだありません。")
         return
 
-    aggregated = [e for e in entries if _is_included_in_sum(e)]
-    if not aggregated:
-        await interaction.followup.send(
-            "集計対象ONの記録がありません。記録時に集計対象をONにしてください。"
-        )
-        return
-
-    total_expense = sum(e["円換算額"] for e in aggregated if e["種別"] == "支出")
-    total_income = sum(e["円換算額"] for e in aggregated if e["種別"] == "収入")
+    total_expense = sum(e["円換算額"] for e in aggregated if _is_expense_entry(e))
+    total_budget = sum(e["円換算額"] for e in aggregated if _is_budget_entry(e))
 
     by_country = defaultdict(float)
     for e in aggregated:
-        if e["種別"] == "支出":
+        if _is_expense_entry(e):
             by_country[e.get("国", DEFAULT_COUNTRY)] += e["円換算額"]
 
-    embed = discord.Embed(title="🌍 全体サマリー（集計対象ONのみ）", color=discord.Color.purple())
-    embed.add_field(name="支出合計", value=f"{total_expense:,.0f}円", inline=True)
-    embed.add_field(name="収入合計", value=f"{total_income:,.0f}円", inline=True)
-    embed.add_field(name="収支", value=f"{total_income - total_expense:,.0f}円", inline=True)
+    my_id = str(interaction.user.id)
+    my_memo_total = _memo_jpy_total(
+        [m for m in all_memos if m.get("ユーザーID") == my_id],
+        require_include=True,
+    )
+    memo_by_user = _memo_totals_by_user(all_memos, require_include=True)
+    name_of = await _build_name_resolver(interaction.guild, set(memo_by_user.keys()))
 
-    country_lines = [f"{c}: {v:,.0f}円" for c, v in sorted(by_country.items(), key=lambda x: -x[1])]
-    if country_lines:
-        embed.add_field(name="国別支出", value="\n".join(country_lines), inline=False)
+    embed = discord.Embed(
+        title="🌍 全体サマリー",
+        color=discord.Color.purple(),
+    )
+
+    # 1) MEMO抜き
+    if aggregated:
+        no_memo_lines = [
+            f"支出: {total_expense:,.0f}円",
+            f"予算: {total_budget:,.0f}円",
+            f"残高: {total_budget - total_expense:,.0f}円",
+        ]
+        country_lines = [
+            f"{c}: {v:,.0f}円"
+            for c, v in sorted(by_country.items(), key=lambda x: -x[1])
+        ]
+        if country_lines:
+            no_memo_lines.append("国別支出:")
+            no_memo_lines.extend(f"・{line}" for line in country_lines)
+        embed.add_field(
+            name="① MEMO抜き（共有・集計対象ON）",
+            value="\n".join(no_memo_lines),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="① MEMO抜き（共有・集計対象ON）",
+            value="集計対象ONの記録なし",
+            inline=False,
+        )
+
+    # 2) それぞれのMEMO合計
+    if memo_by_user:
+        user_lines = [
+            f"{name_of(uid)}: {amount:,.0f}円"
+            for uid, amount in sorted(memo_by_user.items(), key=lambda x: -x[1])
+        ]
+        embed.add_field(
+            name="② それぞれのMEMO合計（集計対象ON）",
+            value="\n".join(user_lines),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="② それぞれのMEMO合計（集計対象ON）",
+            value="集計対象ONの買い物メモなし",
+            inline=False,
+        )
+
+    # 3) 自分のMEMO込（共有支出は2人割り想定で半分）
+    shared_half = float(total_expense) / 2
+    embed.add_field(
+        name="③ 自分のMEMO込（集計対象ON）",
+        value=(
+            f"共有支出÷2 {shared_half:,.0f}円 + 自分のメモ {my_memo_total:,.0f}円\n"
+            f"= **{shared_half + my_memo_total:,.0f}円**"
+        ),
+        inline=False,
+    )
 
     await interaction.followup.send(embed=embed)
 
@@ -963,7 +1500,7 @@ async def log_ls(interaction: discord.Interaction, country: str | None = None):
     )
     lines = []
     for e in filtered:
-        sign = "-" if e["種別"] == "支出" else "+"
+        sign = _entry_sign(e)
         line = (
             f"**[{e['ID']}]** {e['日時']} {sign}{e['円換算額']:,.0f}円 {e.get('国','')} "
             f"{e.get('タグ','')} {e.get('メモ','')}"
@@ -1031,7 +1568,7 @@ def _entry_detail_embed(entry: dict) -> discord.Embed:
         title=f"✏️ 記録の編集 (ID: {entry_id})",
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="種別", value=entry_type or "-", inline=True)
+    embed.add_field(name="種別", value=_display_entry_type(entry_type), inline=True)
     embed.add_field(name="日時", value=str(entry.get("日時") or "-"), inline=True)
     embed.add_field(name="国", value=str(entry.get("国") or "-"), inline=True)
 
@@ -1438,7 +1975,7 @@ async def log_wari(interaction: discord.Interaction, country: str | None = None)
 
     split_entries = [
         e for e in entries
-        if e.get("割り勘") == "ON" and e.get("種別") == "支出" and (not country or e.get("国") == country)
+        if e.get("割り勘") == "ON" and _is_expense_entry(e) and (not country or e.get("国") == country)
     ]
 
     if not split_entries:
