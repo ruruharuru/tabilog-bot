@@ -165,6 +165,18 @@ def _participant_ids(entry: dict) -> list[str]:
     return [uid for value in values if (uid := _valid_discord_id(value))]
 
 
+def _split_party_ids(entry: dict) -> list[str]:
+    """割り勘の負担メンバー = 参加者 ∪ 支払者。
+
+    参加者欄には支払者以外だけを保存する場合があるため、精算時は支払者を含める。
+    """
+    parties = set(_participant_ids(entry))
+    payer = _valid_discord_id(entry.get("支払者ID", ""))
+    if payer:
+        parties.add(payer)
+    return sorted(parties)
+
+
 def _resolve_currency(
     country: str,
     binding: dict | None,
@@ -383,35 +395,21 @@ class EntryModal(discord.ui.Modal):
         embed.insert_field_at(1, name="日時", value=recorded_at, inline=True)
         await interaction.followup.send(embed=embed)
 
-        if self.entry_type == "支出":
-            guide = (
-                f"ID {entry_id}: 下でまとめて選んでから確定してください。\n"
-                "・タグ（任意）\n"
-                "・割り勘あり → 支払者と参加者を選んで「割り勘ありで確定」\n"
-                "・集計対象にしたい場合は「集計対象: OFF」ボタンで ON に切り替え"
-            )
-            if DEFAULT_SPLIT_PARTICIPANT_IDS:
-                guide += "\n※参加者は既定メンバーを選択済み（変更可）"
-        else:
-            guide = (
-                f"ID {entry_id}: タグを選んで「確定」を押してください"
-                "（集計対象にしたい場合はボタンで ON に切り替え）。"
-            )
-
         default_participant_ids = []
         if self.entry_type == "支出":
             default_participant_ids = await _exclude_bot_user_ids(
                 DEFAULT_SPLIT_PARTICIPANT_IDS
             )
 
+        options_view = EntryOptionsView(
+            entry_id=entry_id,
+            entry_type=self.entry_type,
+            tags=tags,
+            default_participant_ids=default_participant_ids,
+        )
         await interaction.followup.send(
-            content=guide,
-            view=EntryOptionsView(
-                entry_id=entry_id,
-                entry_type=self.entry_type,
-                tags=tags,
-                default_participant_ids=default_participant_ids,
-            ),
+            content=options_view.status_text(),
+            view=options_view,
         )
 
 
@@ -625,14 +623,62 @@ class EntryOptionsView(discord.ui.View):
         self.available_tags = tags[:25]
         self.selected_tags: list[str] = []
         self.payer_id: str | None = None
-        self.participant_ids: set[str] = (
-            set(default_participant_ids or []) if entry_type == "支出" else set()
-        )
+        self._default_participant_ids = [
+            str(uid) for uid in (default_participant_ids or [])
+        ]
+        # 参加者は UserSelect で選ぶ。確定時にコンポーネントから再読まず、
+        # on_participants で確定した self.participant_ids だけを信じる。
+        self.participant_ids: set[str] = set()
+        self._participants_touched = False
+        # View ごとに unique な custom_id にし、他メッセージの選択汚染を防ぐ
+        self._id_suffix = os.urandom(4).hex()
         self.include_in_sum = False
         self._build_items()
 
+    def _cid(self, name: str) -> str:
+        return f"{name}_{self._id_suffix}"
+
+    def _effective_participant_ids(self) -> set[str]:
+        """指定あり → その内容 / 指定なし → デフォルトメンバー。"""
+        if self._participants_touched:
+            return set(self.participant_ids)
+        return set(self._default_participant_ids)
+
+    def status_text(self) -> str:
+        """現在の選択状態をメッセージ本文に出す。"""
+        if self.entry_type != "支出":
+            return (
+                f"ID {self.entry_id}: タグを選んで「確定」を押してください"
+                "（集計対象にしたい場合はボタンで ON に切り替え）。"
+            )
+
+        lines = [
+            f"ID {self.entry_id}: 下で選んでから確定してください。",
+            "・タグ（任意） / 支払者（割り勘時）",
+            "・参加者は割り勘メンバー（支払者以外だけ選んでも可／未操作ならデフォルト）",
+            "・集計対象はボタンで ON/OFF",
+        ]
+        if self.payer_id:
+            lines.append(f"支払者: <@{self.payer_id}>")
+        else:
+            lines.append("支払者: （未選択）")
+
+        effective = self._effective_participant_ids()
+        if self._participants_touched:
+            if effective:
+                names = ", ".join(f"<@{uid}>" for uid in sorted(effective))
+                lines.append(f"参加者: {names}（選択済み）")
+            else:
+                lines.append("参加者: （空選択 → 確定時はデフォルト）")
+        elif effective:
+            names = ", ".join(f"<@{uid}>" for uid in sorted(effective))
+            lines.append(f"参加者: {names}（デフォルト・メニュー未操作）")
+        else:
+            lines.append("参加者: （デフォルトなし・メニューで選択）")
+        return "\n".join(lines)
+
     def _build_items(self):
-        """選択状態を default に反映しつつコンポーネントを組み立てる。"""
+        """選択状態を反映しつつコンポーネントを組み立てる。"""
         self.clear_items()
         next_row = 0
 
@@ -646,7 +692,7 @@ class EntryOptionsView(discord.ui.View):
                 for tag in self.available_tags
             ]
             tag_select = discord.ui.Select(
-                custom_id="entry_tags",
+                custom_id=self._cid("entry_tags"),
                 placeholder="タグ（任意・複数可）",
                 min_values=0,
                 max_values=min(len(options), 25),
@@ -667,7 +713,7 @@ class EntryOptionsView(discord.ui.View):
                     )
                 ]
             payer_select = discord.ui.UserSelect(
-                custom_id="entry_payer",
+                custom_id=self._cid("entry_payer"),
                 placeholder="支払者（割り勘時は必須）",
                 min_values=0,
                 max_values=1,
@@ -678,16 +724,20 @@ class EntryOptionsView(discord.ui.View):
             self.add_item(payer_select)
             next_row += 1
 
-            participant_defaults = [
-                discord.SelectDefaultValue(
-                    id=int(uid),
-                    type=discord.SelectDefaultValueType.user,
-                )
-                for uid in sorted(self.participant_ids)
-            ]
+            # 初期はデフォルトを default_values に載せない（Discordが引き戻すため）。
+            # ユーザーが選んだ後だけ、その選択を default_values に焼き直す。
+            participant_defaults = []
+            if self._participants_touched and self.participant_ids:
+                participant_defaults = [
+                    discord.SelectDefaultValue(
+                        id=int(uid),
+                        type=discord.SelectDefaultValueType.user,
+                    )
+                    for uid in sorted(self.participant_ids)
+                ]
             participants_select = discord.ui.UserSelect(
-                custom_id="entry_participants",
-                placeholder="参加者（割り勘時・複数可）",
+                custom_id=self._cid("entry_participants"),
+                placeholder="参加者（支払者以外だけでも可／未操作ならデフォルト）",
                 min_values=0,
                 max_values=10,
                 row=next_row,
@@ -706,109 +756,150 @@ class EntryOptionsView(discord.ui.View):
                 if self.include_in_sum
                 else discord.ButtonStyle.danger
             ),
-            custom_id="toggle_include_sum",
+            custom_id=self._cid("toggle_include_sum"),
             row=button_row,
         )
         btn_toggle.callback = self.toggle_include_sum
         self.add_item(btn_toggle)
-        self._btn_toggle = btn_toggle
 
         if self.entry_type == "支出":
+            if self._participants_touched:
+                btn_reset = discord.ui.Button(
+                    label="デフォルトに戻す",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=self._cid("reset_participants"),
+                    row=button_row,
+                )
+                btn_reset.callback = self.reset_participants
+                self.add_item(btn_reset)
+
+            # 確定ボタンは次の行にまとめ、色で役割を分ける
+            confirm_row = min(button_row + 1, 4)
             btn_split = discord.ui.Button(
                 label="割り勘ありで確定",
-                style=discord.ButtonStyle.primary,
-                custom_id="confirm_split",
-                row=button_row,
+                style=discord.ButtonStyle.success,
+                custom_id=self._cid("confirm_split"),
+                row=confirm_row,
             )
             btn_split.callback = self.confirm_split
             self.add_item(btn_split)
 
             btn_plain = discord.ui.Button(
                 label="割り勘なしで確定",
-                style=discord.ButtonStyle.secondary,
-                custom_id="confirm_plain",
-                row=button_row,
+                style=discord.ButtonStyle.primary,
+                custom_id=self._cid("confirm_plain"),
+                row=confirm_row,
             )
             btn_plain.callback = self.confirm_plain
             self.add_item(btn_plain)
         else:
             btn_ok = discord.ui.Button(
                 label="確定",
-                style=discord.ButtonStyle.primary,
-                custom_id="confirm_income",
+                style=discord.ButtonStyle.success,
+                custom_id=self._cid("confirm_income"),
                 row=button_row,
             )
             btn_ok.callback = self.confirm_plain
             self.add_item(btn_ok)
 
-    def _sync_selections(self):
-        """現在のコンポーネント値をインスタンスに保存する。"""
+    def _sync_tag_and_payer(self):
+        """タグ・支払者だけ同期する。参加者は絶対にここから更新しない。"""
         for item in self.children:
-            if isinstance(item, discord.ui.Select) and item.custom_id == "entry_tags":
-                if item.values:
-                    self.selected_tags = list(item.values)
-            elif isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_payer":
-                if item.values:
-                    payer = item.values[0]
-                    self.payer_id = None if payer.bot else str(payer.id)
-            elif isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_participants":
-                if item.values:
-                    self.participant_ids = {
-                        str(user.id) for user in item.values if not user.bot
-                    }
+            if isinstance(item, discord.ui.Select) and str(item.custom_id).startswith(
+                "entry_tags_"
+            ):
+                stored = getattr(item, "_values", None) or []
+                if stored:
+                    self.selected_tags = list(stored)
+            elif isinstance(item, discord.ui.UserSelect) and str(
+                item.custom_id
+            ).startswith("entry_payer_"):
+                stored = getattr(item, "_values", None) or []
+                if stored:
+                    payer = stored[0]
+                    self.payer_id = (
+                        None if getattr(payer, "bot", False) else str(payer.id)
+                    )
+
+    async def _persist_view(
+        self, interaction: discord.Interaction, *, notice: str | None = None
+    ):
+        """選択状態をメッセージ本文と View に反映する。"""
+        self._build_items()
+        await interaction.response.edit_message(
+            content=self.status_text(),
+            view=self,
+        )
+        if notice:
+            await interaction.followup.send(notice, ephemeral=True)
 
     async def on_tags(self, interaction: discord.Interaction):
         for item in self.children:
-            if isinstance(item, discord.ui.Select) and item.custom_id == "entry_tags":
+            if isinstance(item, discord.ui.Select) and str(item.custom_id).startswith(
+                "entry_tags_"
+            ):
                 self.selected_tags = list(item.values)
-        await interaction.response.defer()
+        await self._persist_view(interaction)
 
     async def on_payer(self, interaction: discord.Interaction):
         bot_selected = False
         for item in self.children:
-            if isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_payer":
+            if isinstance(item, discord.ui.UserSelect) and str(
+                item.custom_id
+            ).startswith("entry_payer_"):
                 payer = item.values[0] if item.values else None
                 bot_selected = bool(payer and payer.bot)
                 self.payer_id = str(payer.id) if payer and not payer.bot else None
-        if bot_selected:
-            self._build_items()
-            await interaction.response.edit_message(view=self)
-            await interaction.followup.send(
-                "Botは支払者に選択できません。", ephemeral=True
-            )
-        else:
-            await interaction.response.defer()
+        notice = "Botは支払者に選択できません。" if bot_selected else None
+        await self._persist_view(interaction, notice=notice)
 
     async def on_participants(self, interaction: discord.Interaction):
+        """参加者選択。ここで決めた値だけを確定時に使う（ボタン押下では再読しない）。"""
+        selected: set[str] = set()
         bot_selected = False
         for item in self.children:
-            if isinstance(item, discord.ui.UserSelect) and item.custom_id == "entry_participants":
+            if isinstance(item, discord.ui.UserSelect) and str(
+                item.custom_id
+            ).startswith("entry_participants_"):
                 bot_selected = any(user.bot for user in item.values)
-                self.participant_ids = {
+                selected = {
                     str(user.id) for user in item.values if not user.bot
                 }
-        if bot_selected:
-            self._build_items()
-            await interaction.response.edit_message(view=self)
-            await interaction.followup.send(
-                "Botは割り勘参加者に選択できません。", ephemeral=True
-            )
+        if selected:
+            self._participants_touched = True
+            self.participant_ids = selected
         else:
-            await interaction.response.defer()
+            # 空選択 = 指定なし → デフォルトに戻す
+            self._participants_touched = False
+            self.participant_ids = set()
+        log.info(
+            "on_participants entry=%s touched=%s selected=%s",
+            self.entry_id,
+            self._participants_touched,
+            sorted(self.participant_ids),
+        )
+        notice = (
+            "Botは割り勘参加者に選択できません。" if bot_selected else None
+        )
+        await self._persist_view(interaction, notice=notice)
+
+    async def reset_participants(self, interaction: discord.Interaction):
+        self._participants_touched = False
+        self.participant_ids = set()
+        await self._persist_view(interaction)
 
     async def toggle_include_sum(self, interaction: discord.Interaction):
-        self._sync_selections()
+        self._sync_tag_and_payer()
         self.include_in_sum = not self.include_in_sum
-        self._build_items()
-        await interaction.response.edit_message(view=self)
+        await self._persist_view(interaction)
 
     def _collect_options(self) -> tuple[str, str | None, set[str], bool]:
-        """確定時点の選択値を返す（保存済み状態を優先）。"""
-        self._sync_selections()
+        """確定時点の選択値。参加者は on_participants の結果のみ使用。"""
+        self._sync_tag_and_payer()
         return (
             ",".join(self.selected_tags),
             self.payer_id,
-            set(self.participant_ids),
+            self._effective_participant_ids(),
             self.include_in_sum,
         )
     async def _finish_message(self, interaction: discord.Interaction, content: str):
@@ -850,14 +941,35 @@ class EntryOptionsView(discord.ui.View):
             )
             return
 
+        # 参加者が選んだ内容をそのまま保存する（支払者は自動追加しない）。
+        # 精算（/log_wari）では 参加者 ∪ 支払者 を負担人数として使う。
         participants = set(participant_ids)
-        participants.add(payer_id)
-        if len(participants) < 2:
+        if not participants:
             await interaction.response.send_message(
-                "割り勘ありの場合は、支払者以外の参加者も1人以上選んでください。",
+                "参加者が空です。メニューで選ぶか、デフォルトメンバーが設定されているか確認してください。",
                 ephemeral=True,
             )
             return
+
+        parties = set(participants)
+        parties.add(payer_id)
+        if len(parties) < 2:
+            await interaction.response.send_message(
+                "割り勘は支払者を含めて2人以上必要です。"
+                "参加者メニューで、支払者以外を1人以上選んでください。",
+                ephemeral=True,
+            )
+            return
+
+        log.info(
+            "confirm_split id=%s payer=%s participants=%s parties=%s touched=%s defaults=%s",
+            self.entry_id,
+            payer_id,
+            sorted(participants),
+            sorted(parties),
+            self._participants_touched,
+            self._default_participant_ids,
+        )
 
         await interaction.response.defer()
         st = get_store()
@@ -871,6 +983,7 @@ class EntryOptionsView(discord.ui.View):
         )
 
         names = ", ".join(f"<@{uid}>" for uid in sorted(participants))
+        party_note = f"負担人数: {len(parties)}人（支払者含む）\n"
         tag_note = f"タグ: {tags}\n" if tags else ""
         agg_note = "集計対象: ON\n" if include_in_sum else ""
         await self._finish_message(
@@ -880,7 +993,8 @@ class EntryOptionsView(discord.ui.View):
                 f"{tag_note}"
                 f"{agg_note}"
                 f"支払者: <@{payer_id}>\n"
-                f"参加者: {names}"
+                f"参加者: {names}\n"
+                f"{party_note}"
             ),
         )
 
@@ -1697,9 +1811,7 @@ async def _apply_field_update(
         if not ids:
             await reply("参加者は @ユーザー名 で指定してください（複数可）。", ephemeral=True)
             return False
-        payer = _valid_discord_id(target.get("支払者ID", ""))
-        if payer:
-            ids.append(payer)
+        # 支払者は自動追加しない（選択内容をそのまま保存）
         ids = sorted(set(ids))
         await run_sync(st.update_field, entry_id, "参加者ID", ",".join(ids))
         names = ", ".join(f"<@{uid}>" for uid in ids)
@@ -1988,12 +2100,13 @@ async def log_wari(interaction: discord.Interaction, country: str | None = None)
     for e in split_entries:
         participants = _participant_ids(e)
         payer = _valid_discord_id(e.get("支払者ID", ""))
-        if not participants or not payer:
+        parties = _split_party_ids(e)
+        if not participants or not payer or len(parties) < 2:
             invalid_entry_ids.append(str(e.get("ID", "?")))
             continue
         amount = float(e["円換算額"])
-        share = amount / len(participants)
-        for p in participants:
+        share = amount / len(parties)
+        for p in parties:
             if p == payer:
                 continue
             balance[p] -= share
