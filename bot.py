@@ -165,16 +165,13 @@ def _participant_ids(entry: dict) -> list[str]:
     return [uid for value in values if (uid := _valid_discord_id(value))]
 
 
-def _split_party_ids(entry: dict) -> list[str]:
-    """割り勘の負担メンバー = 参加者 ∪ 支払者。
+def _split_burden_ids(entry: dict) -> list[str]:
+    """負担者は参加者欄だけ。支払者は自動では含めない。
 
-    参加者欄には支払者以外だけを保存する場合があるため、精算時は支払者を含める。
+    支払者が参加者に入っていれば、その人の分も等分する。
+    入っていなければ全額立て替え（参加者だけが負担）。
     """
-    parties = set(_participant_ids(entry))
-    payer = _valid_discord_id(entry.get("支払者ID", ""))
-    if payer:
-        parties.add(payer)
-    return sorted(parties)
+    return _participant_ids(entry)
 
 
 def _resolve_currency(
@@ -942,7 +939,7 @@ class EntryOptionsView(discord.ui.View):
             return
 
         # 参加者が選んだ内容をそのまま保存する（支払者は自動追加しない）。
-        # 精算（/log_wari）では 参加者 ∪ 支払者 を負担人数として使う。
+        # 精算の負担者は参加者のみ。支払者が参加者にいなければ全額立て替え。
         participants = set(participant_ids)
         if not participants:
             await interaction.response.send_message(
@@ -2098,17 +2095,17 @@ async def log_wari(interaction: discord.Interaction, country: str | None = None)
     invalid_entry_ids = []
 
     for e in split_entries:
-        participants = _participant_ids(e)
+        participants = _split_burden_ids(e)
         payer = _valid_discord_id(e.get("支払者ID", ""))
-        parties = _split_party_ids(e)
-        if not participants or not payer or len(parties) < 2:
+        # 負担者 = 参加者のみ。支払者が別人なら立て替え（全額を参加者が負担）。
+        burden = list(dict.fromkeys(participants))
+        debtors = [p for p in burden if p != payer]
+        if not payer or not debtors:
             invalid_entry_ids.append(str(e.get("ID", "?")))
             continue
         amount = float(e["円換算額"])
-        share = amount / len(parties)
-        for p in parties:
-            if p == payer:
-                continue
+        share = amount / len(burden)
+        for p in debtors:
             balance[p] -= share
             balance[payer] += share
 
