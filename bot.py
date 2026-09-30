@@ -2,7 +2,7 @@
 TabiLog Bot - 世界一周の費用ログ用Discord Bot
 
 コマンド一覧:
-  /log_ex      支出を記録（金額入力→タグ/割り勘を1画面で選択）
+  /log_ex      支出を記録（金額入力→タグ・集計対象を選択）
   /log_in      予算を記録（実行者の個人予算として保存）
   /log_memo    自分用の買い物メモを記録
   /log_memo_ls 自分の買い物メモ一覧（自分だけに表示）
@@ -12,7 +12,7 @@ TabiLog Bot - 世界一周の費用ログ用Discord Bot
   /log_tag_rm  タグを削除
   /log_tag_ls  登録タグ一覧
   /log_sum     国・タグで絞り込み集計（自分だけに表示）
-  /log_all     全体サマリー
+  /log_all     全体サマリー（国別 / メモ / 個人残高）
   /log_ls      ID付き一覧表示（自分だけに表示）
   /log_ed      IDを指定して記録を確認・修正
   /log_rm      IDを複数指定して削除
@@ -190,7 +190,8 @@ def _entry_burden_for_user(entry: dict, user_id: str) -> float:
     """ユーザーの実質負担額（円）。
 
     割り勘ON: 参加者に含まれていれば人数で等分。
-    割り勘OFFの支出: 支払者が本人なら全額。
+    割り勘OFFの支出: 支払者が本人のときだけ全額。
+    支払者未設定は 0（他人の支払い・データ欠損を自分の負担に混ぜない）。
     予算は 0。
     """
     if not _is_expense_entry(entry):
@@ -562,17 +563,10 @@ class EntryModal(discord.ui.Modal):
         embed.insert_field_at(1, name="日時", value=recorded_at, inline=True)
         await interaction.followup.send(embed=embed)
 
-        default_participant_ids = []
-        if self.entry_type == "支出":
-            default_participant_ids = await _exclude_bot_user_ids(
-                DEFAULT_SPLIT_PARTICIPANT_IDS
-            )
-
         options_view = EntryOptionsView(
             entry_id=entry_id,
             entry_type=self.entry_type,
             tags=tags,
-            default_participant_ids=default_participant_ids,
         )
         await interaction.followup.send(
             content=options_view.status_text(),
@@ -775,29 +769,19 @@ class MemoOptionsView(discord.ui.View):
 
 
 class EntryOptionsView(discord.ui.View):
-    """タグ・支払者・参加者を1メッセージ内で選び、ボタンで確定する。"""
+    """タグと集計対象を選んで確定する（単独運用・割り勘UIなし）。"""
 
     def __init__(
         self,
         entry_id: int,
         entry_type: str,
         tags: list[str],
-        default_participant_ids: list[str] | None = None,
     ):
         super().__init__(timeout=300)
         self.entry_id = entry_id
         self.entry_type = entry_type
         self.available_tags = tags[:25]
         self.selected_tags: list[str] = []
-        self.payer_id: str | None = None
-        self._default_participant_ids = [
-            str(uid) for uid in (default_participant_ids or [])
-        ]
-        # 参加者は UserSelect で選ぶ。確定時にコンポーネントから再読まず、
-        # on_participants で確定した self.participant_ids だけを信じる。
-        self.participant_ids: set[str] = set()
-        self._participants_touched = False
-        # View ごとに unique な custom_id にし、他メッセージの選択汚染を防ぐ
         self._id_suffix = os.urandom(4).hex()
         self.include_in_sum = False
         self._build_items()
@@ -805,47 +789,14 @@ class EntryOptionsView(discord.ui.View):
     def _cid(self, name: str) -> str:
         return f"{name}_{self._id_suffix}"
 
-    def _effective_participant_ids(self) -> set[str]:
-        """指定あり → その内容 / 指定なし → デフォルトメンバー。"""
-        if self._participants_touched:
-            return set(self.participant_ids)
-        return set(self._default_participant_ids)
-
     def status_text(self) -> str:
-        """現在の選択状態をメッセージ本文に出す。"""
-        if self.entry_type != "支出":
-            return (
-                f"ID {self.entry_id}: タグを選んで「確定」を押してください"
-                "（集計対象にしたい場合はボタンで ON に切り替え）。"
-            )
-
-        lines = [
-            f"ID {self.entry_id}: 下で選んでから確定してください。",
-            "・タグ（任意） / 支払者（割り勘時）",
-            "・参加者は割り勘メンバー（支払者以外だけ選んでも可／未操作ならデフォルト）",
-            "・集計対象はボタンで ON/OFF",
-        ]
-        if self.payer_id:
-            lines.append(f"支払者: {self.payer_id}")
-        else:
-            lines.append("支払者: （未選択）")
-
-        effective = self._effective_participant_ids()
-        if self._participants_touched:
-            if effective:
-                names = ", ".join(str(uid) for uid in sorted(effective))
-                lines.append(f"参加者: {names}（選択済み）")
-            else:
-                lines.append("参加者: （空選択 → 確定時はデフォルト）")
-        elif effective:
-            names = ", ".join(str(uid) for uid in sorted(effective))
-            lines.append(f"参加者: {names}（デフォルト・メニュー未操作）")
-        else:
-            lines.append("参加者: （デフォルトなし・メニューで選択）")
-        return "\n".join(lines)
+        kind = "支出" if self.entry_type == "支出" else "予算"
+        return (
+            f"ID {self.entry_id}（{kind}）: タグを選んで「確定」を押してください"
+            "（集計対象にしたい場合はボタンで ON に切り替え）。"
+        )
 
     def _build_items(self):
-        """選択状態を反映しつつコンポーネントを組み立てる。"""
         self.clear_items()
         next_row = 0
 
@@ -870,52 +821,6 @@ class EntryOptionsView(discord.ui.View):
             self.add_item(tag_select)
             next_row += 1
 
-        if self.entry_type == "支出":
-            payer_defaults = []
-            if self.payer_id:
-                payer_defaults = [
-                    discord.SelectDefaultValue(
-                        id=int(self.payer_id),
-                        type=discord.SelectDefaultValueType.user,
-                    )
-                ]
-            payer_select = discord.ui.UserSelect(
-                custom_id=self._cid("entry_payer"),
-                placeholder="支払者（割り勘時は必須）",
-                min_values=0,
-                max_values=1,
-                row=next_row,
-                default_values=payer_defaults,
-            )
-            payer_select.callback = self.on_payer
-            self.add_item(payer_select)
-            next_row += 1
-
-            # 初期はデフォルトを default_values に載せない（Discordが引き戻すため）。
-            # ユーザーが選んだ後だけ、その選択を default_values に焼き直す。
-            participant_defaults = []
-            if self._participants_touched and self.participant_ids:
-                participant_defaults = [
-                    discord.SelectDefaultValue(
-                        id=int(uid),
-                        type=discord.SelectDefaultValueType.user,
-                    )
-                    for uid in sorted(self.participant_ids)
-                ]
-            participants_select = discord.ui.UserSelect(
-                custom_id=self._cid("entry_participants"),
-                placeholder="参加者（支払者以外だけでも可／未操作ならデフォルト）",
-                min_values=0,
-                max_values=10,
-                row=next_row,
-                default_values=participant_defaults[:25],
-            )
-            participants_select.callback = self.on_participants
-            self.add_item(participants_select)
-            next_row += 1
-
-        button_row = next_row
-
         btn_toggle = discord.ui.Button(
             label=f"集計対象: {'ON' if self.include_in_sum else 'OFF'}",
             style=(
@@ -924,53 +829,21 @@ class EntryOptionsView(discord.ui.View):
                 else discord.ButtonStyle.danger
             ),
             custom_id=self._cid("toggle_include_sum"),
-            row=button_row,
+            row=next_row,
         )
         btn_toggle.callback = self.toggle_include_sum
         self.add_item(btn_toggle)
 
-        if self.entry_type == "支出":
-            if self._participants_touched:
-                btn_reset = discord.ui.Button(
-                    label="デフォルトに戻す",
-                    style=discord.ButtonStyle.secondary,
-                    custom_id=self._cid("reset_participants"),
-                    row=button_row,
-                )
-                btn_reset.callback = self.reset_participants
-                self.add_item(btn_reset)
+        btn_ok = discord.ui.Button(
+            label="確定",
+            style=discord.ButtonStyle.success,
+            custom_id=self._cid("confirm"),
+            row=next_row,
+        )
+        btn_ok.callback = self.confirm
+        self.add_item(btn_ok)
 
-            # 確定ボタンは次の行にまとめ、色で役割を分ける
-            confirm_row = min(button_row + 1, 4)
-            btn_split = discord.ui.Button(
-                label="割り勘ありで確定",
-                style=discord.ButtonStyle.success,
-                custom_id=self._cid("confirm_split"),
-                row=confirm_row,
-            )
-            btn_split.callback = self.confirm_split
-            self.add_item(btn_split)
-
-            btn_plain = discord.ui.Button(
-                label="割り勘なしで確定",
-                style=discord.ButtonStyle.primary,
-                custom_id=self._cid("confirm_plain"),
-                row=confirm_row,
-            )
-            btn_plain.callback = self.confirm_plain
-            self.add_item(btn_plain)
-        else:
-            btn_ok = discord.ui.Button(
-                label="確定",
-                style=discord.ButtonStyle.success,
-                custom_id=self._cid("confirm_income"),
-                row=button_row,
-            )
-            btn_ok.callback = self.confirm_plain
-            self.add_item(btn_ok)
-
-    def _sync_tag_and_payer(self):
-        """タグ・支払者だけ同期する。参加者は絶対にここから更新しない。"""
+    def _sync_tags(self):
         for item in self.children:
             if isinstance(item, discord.ui.Select) and str(item.custom_id).startswith(
                 "entry_tags_"
@@ -978,27 +851,13 @@ class EntryOptionsView(discord.ui.View):
                 stored = getattr(item, "_values", None) or []
                 if stored:
                     self.selected_tags = list(stored)
-            elif isinstance(item, discord.ui.UserSelect) and str(
-                item.custom_id
-            ).startswith("entry_payer_"):
-                stored = getattr(item, "_values", None) or []
-                if stored:
-                    payer = stored[0]
-                    self.payer_id = (
-                        None if getattr(payer, "bot", False) else str(payer.id)
-                    )
 
-    async def _persist_view(
-        self, interaction: discord.Interaction, *, notice: str | None = None
-    ):
-        """選択状態をメッセージ本文と View に反映する。"""
+    async def _persist_view(self, interaction: discord.Interaction):
         self._build_items()
         await interaction.response.edit_message(
             content=self.status_text(),
             view=self,
         )
-        if notice:
-            await interaction.followup.send(notice, ephemeral=True)
 
     async def on_tags(self, interaction: discord.Interaction):
         for item in self.children:
@@ -1008,80 +867,28 @@ class EntryOptionsView(discord.ui.View):
                 self.selected_tags = list(item.values)
         await self._persist_view(interaction)
 
-    async def on_payer(self, interaction: discord.Interaction):
-        bot_selected = False
-        for item in self.children:
-            if isinstance(item, discord.ui.UserSelect) and str(
-                item.custom_id
-            ).startswith("entry_payer_"):
-                payer = item.values[0] if item.values else None
-                bot_selected = bool(payer and payer.bot)
-                self.payer_id = str(payer.id) if payer and not payer.bot else None
-        notice = "Botは支払者に選択できません。" if bot_selected else None
-        await self._persist_view(interaction, notice=notice)
-
-    async def on_participants(self, interaction: discord.Interaction):
-        """参加者選択。ここで決めた値だけを確定時に使う（ボタン押下では再読しない）。"""
-        selected: set[str] = set()
-        bot_selected = False
-        for item in self.children:
-            if isinstance(item, discord.ui.UserSelect) and str(
-                item.custom_id
-            ).startswith("entry_participants_"):
-                bot_selected = any(user.bot for user in item.values)
-                selected = {
-                    str(user.id) for user in item.values if not user.bot
-                }
-        if selected:
-            self._participants_touched = True
-            self.participant_ids = selected
-        else:
-            # 空選択 = 指定なし → デフォルトに戻す
-            self._participants_touched = False
-            self.participant_ids = set()
-        log.info(
-            "on_participants entry=%s touched=%s selected=%s",
-            self.entry_id,
-            self._participants_touched,
-            sorted(self.participant_ids),
-        )
-        notice = (
-            "Botは割り勘参加者に選択できません。" if bot_selected else None
-        )
-        await self._persist_view(interaction, notice=notice)
-
-    async def reset_participants(self, interaction: discord.Interaction):
-        self._participants_touched = False
-        self.participant_ids = set()
-        await self._persist_view(interaction)
-
     async def toggle_include_sum(self, interaction: discord.Interaction):
-        self._sync_tag_and_payer()
+        self._sync_tags()
         self.include_in_sum = not self.include_in_sum
         await self._persist_view(interaction)
 
-    def _collect_options(self) -> tuple[str, str | None, set[str], bool]:
-        """確定時点の選択値。参加者は on_participants の結果のみ使用。"""
-        self._sync_tag_and_payer()
-        return (
-            ",".join(self.selected_tags),
-            self.payer_id,
-            self._effective_participant_ids(),
-            self.include_in_sum,
-        )
     async def _finish_message(self, interaction: discord.Interaction, content: str):
         if interaction.message:
             await interaction.message.edit(content=content, view=None)
         else:
             await interaction.followup.send(content)
 
-    async def confirm_plain(self, interaction: discord.Interaction):
+    async def confirm(self, interaction: discord.Interaction):
         await interaction.response.defer()
-        tags, _, _, include_in_sum = self._collect_options()
+        self._sync_tags()
+        tags = ",".join(self.selected_tags)
+        include_in_sum = self.include_in_sum
         st = get_store()
         await run_sync(st.update_field, self.entry_id, "タグ", tags)
         await run_sync(st.update_field, self.entry_id, "割り勘", "OFF")
-        await run_sync(st.update_field, self.entry_id, "支払者ID", "")
+        # 単独運用: 支払者UIは出さないが、実質負担計算用に実行者を入れる
+        payer = str(interaction.user.id) if self.entry_type == "支出" else ""
+        await run_sync(st.update_field, self.entry_id, "支払者ID", payer)
         await run_sync(st.update_split_participants, self.entry_id, "")
         await run_sync(
             st.update_field, self.entry_id, "集計対象", "ON" if include_in_sum else "OFF"
@@ -1098,72 +905,6 @@ class EntryOptionsView(discord.ui.View):
             f"✅ ID {self.entry_id} の記録が完了しました{note}",
         )
 
-    async def confirm_split(self, interaction: discord.Interaction):
-        tags, payer_id, participant_ids, include_in_sum = self._collect_options()
-
-        if not payer_id:
-            await interaction.response.send_message(
-                "割り勘ありの場合は、先に「支払者」を選んでから確定してください。",
-                ephemeral=True,
-            )
-            return
-
-        # 参加者が選んだ内容をそのまま保存する（支払者は自動追加しない）。
-        # 精算の負担者は参加者のみ。支払者が参加者にいなければ全額立て替え。
-        participants = set(participant_ids)
-        if not participants:
-            await interaction.response.send_message(
-                "参加者が空です。メニューで選ぶか、デフォルトメンバーが設定されているか確認してください。",
-                ephemeral=True,
-            )
-            return
-
-        parties = set(participants)
-        parties.add(payer_id)
-        if len(parties) < 2:
-            await interaction.response.send_message(
-                "割り勘は支払者を含めて2人以上必要です。"
-                "参加者メニューで、支払者以外を1人以上選んでください。",
-                ephemeral=True,
-            )
-            return
-
-        log.info(
-            "confirm_split id=%s payer=%s participants=%s parties=%s touched=%s defaults=%s",
-            self.entry_id,
-            payer_id,
-            sorted(participants),
-            sorted(parties),
-            self._participants_touched,
-            self._default_participant_ids,
-        )
-
-        await interaction.response.defer()
-        st = get_store()
-        participants_str = ",".join(sorted(participants))
-        await run_sync(st.update_field, self.entry_id, "タグ", tags)
-        await run_sync(st.update_field, self.entry_id, "割り勘", "ON")
-        await run_sync(st.update_field, self.entry_id, "支払者ID", payer_id)
-        await run_sync(st.update_split_participants, self.entry_id, participants_str)
-        await run_sync(
-            st.update_field, self.entry_id, "集計対象", "ON" if include_in_sum else "OFF"
-        )
-
-        names = ", ".join(str(uid) for uid in sorted(participants))
-        party_note = f"負担人数: {len(parties)}人（支払者含む）\n"
-        tag_note = f"タグ: {tags}\n" if tags else ""
-        agg_note = "集計対象: ON\n" if include_in_sum else ""
-        await self._finish_message(
-            interaction,
-            (
-                f"✅ ID {self.entry_id} の割り勘記録が完了しました\n"
-                f"{tag_note}"
-                f"{agg_note}"
-                f"支払者: {payer_id}\n"
-                f"参加者: {names}\n"
-                f"{party_note}"
-            ),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1719,10 +1460,10 @@ async def log_all(interaction: discord.Interaction):
     memo_by_user = _memo_totals_by_user(all_memos, require_include=True)
     name_of = await _build_name_resolver(interaction.guild, set(memo_by_user.keys()))
 
-    # 個人視点（実質負担・個人予算。÷2は使わない）
+    # 個人視点（実質負担＋メモを個人残高から差し引く）
     personal_burden = _personal_burden_total(entries, my_id)
     personal_budget = _personal_budget_total(entries, my_id)
-    personal_balance = personal_budget - personal_burden
+    personal_balance = personal_budget - personal_burden - my_memo_total
 
     embed = discord.Embed(
         title="🌍 全体サマリー",
@@ -1765,45 +1506,17 @@ async def log_all(interaction: discord.Interaction):
             inline=False,
         )
 
-    # 3) 実行者の実質負担（÷2は使わない）
+    # 3) 個人残高 = 個人予算 − 実質負担 − メモ
     embed.add_field(
         name="③ 自分の実質負担・個人予算",
         value=(
-            f"実質負担（割り勘等分込み）: {personal_burden:,.0f}円\n"
+            f"実質負担: {personal_burden:,.0f}円\n"
+            f"自分のメモ（集計対象ON）: {my_memo_total:,.0f}円\n"
             f"個人予算: {personal_budget:,.0f}円\n"
-            f"個人残高: **{personal_balance:,.0f}円**\n"
-            f"自分のメモ（集計対象ON）: {my_memo_total:,.0f}円"
+            f"個人残高（予算 − 実質負担 − メモ）: **{personal_balance:,.0f}円**"
         ),
         inline=False,
     )
-
-    # 4) 最新の建て替え確定
-    latest = await run_sync(st.get_latest_settlement_batch)
-    if latest:
-        settled_at = str(latest[0].get("確定日", "")).strip() or "不明"
-        batch_id = str(latest[0].get("バッチID", "")).strip()
-        country_f = str(latest[0].get("国フィルタ", "")).strip()
-        memo = str(latest[0].get("メモ", "")).strip()
-        settle_name_of = await _build_name_resolver(
-            interaction.guild, _settlement_user_ids(latest)
-        )
-        settle_text = _format_settlement_lines(latest, name_of=settle_name_of)
-        meta = f"確定日: {settled_at} / バッチ #{batch_id}"
-        if country_f:
-            meta += f" / 国: {country_f}"
-        if memo:
-            meta += f"\nメモ: {memo}"
-        embed.add_field(
-            name="④ 建て替え確定（最新）",
-            value=f"{meta}\n{settle_text}",
-            inline=False,
-        )
-    else:
-        embed.add_field(
-            name="④ 建て替え確定（最新）",
-            value="まだありません。`/log_settle` で現在の精算結果を保存できます。",
-            inline=False,
-        )
 
     await interaction.followup.send(embed=embed)
 
