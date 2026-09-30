@@ -15,25 +15,38 @@
 | `/log_ct` | このスレッド/チャンネルを国/地域に紐付け |
 | `/log_tag_add` / `rm` / `ls` | タグの追加・削除・一覧 |
 | `/log_sum` | 共有集計＋個人実質負担・個人予算残高（自分だけ） |
-| `/log_all` | ①共有/国別 ②メモ ③実質負担 ④建て替え確定 |
+| `/log_all` | ①国別支出 ②メモ ③実質負担 ④建て替え確定 |
 | `/log_ls` | ID付きで直近の記録を一覧表示（自分だけに表示） |
 | `/log_ed` | IDを指定して記録を確認・修正 |
 | `/log_rm` | IDを複数指定して削除 |
-| `/log_wari` | 割り勘のライブ精算（確定スナップショットがあれば併記） |
-| `/log_settle` | 現在の `/log_wari` 結果を建て替え確定として保存 |
+| `/log_settle` | 割り勘精算を建て替え確定として保存（`/log_wari` は廃止） |
 | `/log_settle_ls` | 最新の建て替え確定を再表示 |
+| `/log_settle_ed` | 建て替え確定行の編集（管理者・AuditLog） |
+| `/log_admin_ls` | 監査ログ直近（管理者） |
 
-金額は現地通貨で入力すると、自動的に円換算されます。
+金額は現地通貨で入力すると、自動的に円換算されます。  
+返信はメンション（ping）しません。
 
-### はる単独運用
+### はる単独運用（personal ブランチ）
 
 同行者クローズ後は、同一 Log を継続したまま個人予算運用に寄せます。
 
-1. `DEFAULT_SPLIT_PARTICIPANT_IDS` を空にする（割り勘の既定参加者なし）
-2. `/log_wari` で確認 → `/log_settle` で建て替えを確定保存
-3. 以後の `/log_ex` は原則「割り勘なし」（決済者1人）
-4. `/log_in` は実行者の個人予算。残高は `/log_sum` / `/log_all` ③で確認
-5. 国別・全体の共有支出は `/log_all` ①のまま（Log は分割しない）
+1. `DEFAULT_SPLIT_PARTICIPANT_IDS` を空にする
+2. `ADMIN_USER_IDS` に自分の Discord ユーザーIDを入れる
+3. `/log_settle` で建て替えを確定保存（必要なら `/log_settle_ed` で修正）
+4. 以後の `/log_ex` は原則「割り勘なし」（決済者1人）。国別合計には集計対象ONが反映
+5. `/log_in` は実行者の個人予算。残高は `/log_sum` / `/log_all` ③
+6. `/log_all` ①は **国別支出のみ**（共有の支出・予算・残高は出さない）
+
+### テストコマンド（personal）
+
+1. `/log_all` … ①が国別のみ、支出/予算/残高なし、メンションなし
+2. `/log_settle` … 保存できる
+3. `/log_settle_ls` … 行ID付きで再表示
+4. `/log_settle_ed` … 金額等変更 → Settlements + AuditLog
+5. `/log_admin_ls`
+6. `/log_in` → `/log_sum` … 個人予算・実質負担
+7. `/log_ex`（集計対象ON）→ `/log_all` ①の国別が増える
 
 ## 1. ローカルでのセットアップ
 
@@ -81,6 +94,10 @@ cp .env.example .env
   IDは Discord の設定 → 詳細設定で「開発者モード」をONにし、
   ユーザーを右クリック →「ユーザーIDをコピー」で取得できます。
 
+- **ADMIN_USER_IDS**
+  `/log_settle_ed` / `/log_admin_ls` を使える管理者のユーザーID（カンマ区切り）。
+  **未設定だと管理コマンドは拒否**されます。
+
 ### 起動
 
 ```bash
@@ -127,6 +144,7 @@ Discordの任意のテキストチャンネルで:
    - `GOOGLE_SERVICE_ACCOUNT_JSON`（JSON を1行のまま貼る。Northflank は JSON 値に対応）
    - `GOOGLE_SHEET_ID`
    - （任意）`DEFAULT_SPLIT_PARTICIPANT_IDS`（単独運用なら空／未設定）
+   - （管理コマンド用）`ADMIN_USER_IDS`
 6. Create Service → ビルド〜起動まで数分待つ
 7. サービスログに `Logged in as ...` が出て、Discord 上で Bot が「オンライン」になれば完了
 

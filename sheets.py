@@ -6,6 +6,7 @@ Google Sheets 操作モジュール
   - "Tags"        : 選択用タグ一覧
   - "Memos"       : ユーザー固有の買い物メモ
   - "Settlements" : 建て替え確定スナップショット
+  - "AuditLog"    : 管理コマンドの変更履歴
 存在しない場合は自動で作成する。
 
 【重要】DiscordのIDは18〜19桁なので、Sheetsには必ずRAW文字列として書き込む。
@@ -41,10 +42,14 @@ SETTLEMENT_HEADERS = [
     "ID", "確定日", "バッチID", "債務者ID", "債権者ID", "金額円",
     "メモ", "作成者ID", "国フィルタ",
 ]
+AUDIT_HEADERS = [
+    "ID", "日時", "実行者ID", "対象", "対象ID", "操作", "変更前", "変更後", "メモ",
+]
 
 ID_LIKE_FIELDS = {"チャンネルID", "支払者ID", "参加者ID", "予算ユーザーID"}
 MEMO_ID_LIKE_FIELDS = {"ユーザーID"}
 SETTLEMENT_ID_LIKE_FIELDS = {"債務者ID", "債権者ID", "作成者ID"}
+AUDIT_ID_LIKE_FIELDS = {"実行者ID"}
 
 
 def _get_client():
@@ -92,10 +97,12 @@ class SheetStore:
         self.tag_ws = self._get_or_create_ws("Tags", TAG_HEADERS)
         self.memo_ws = self._get_or_create_ws("Memos", MEMO_HEADERS)
         self.settlement_ws = self._get_or_create_ws("Settlements", SETTLEMENT_HEADERS)
+        self.audit_ws = self._get_or_create_ws("AuditLog", AUDIT_HEADERS)
         self._ensure_log_headers()
         self._ensure_channel_headers()
         self._ensure_memo_headers()
         self._ensure_settlement_headers()
+        self._ensure_audit_headers()
         self._ensure_default_tags()
 
     def _ensure_channel_headers(self):
@@ -137,6 +144,16 @@ class SheetStore:
         missing = [h for h in SETTLEMENT_HEADERS if h not in first_row]
         if missing:
             self.settlement_ws.update([first_row + missing], "A1", raw=True)
+
+    def _ensure_audit_headers(self):
+        """既存AuditLogシートに新列が無ければヘッダーを拡張する。"""
+        first_row = self.audit_ws.row_values(1)
+        if not first_row:
+            self.audit_ws.append_row(AUDIT_HEADERS, value_input_option="RAW")
+            return
+        missing = [h for h in AUDIT_HEADERS if h not in first_row]
+        if missing:
+            self.audit_ws.update([first_row + missing], "A1", raw=True)
 
     def _get_or_create_ws(self, title, headers):
         try:
@@ -498,3 +515,75 @@ class SheetStore:
         if not best_batch:
             return []
         return [r for r in records if str(r.get("バッチID", "")).strip() == best_batch]
+
+    def find_settlement_row_by_id(self, settlement_id: int) -> int | None:
+        ids = self.settlement_ws.col_values(1)
+        target = str(settlement_id)
+        for idx, value in enumerate(ids[1:], start=2):
+            if str(value).strip() == target:
+                return idx
+        return None
+
+    def get_settlement_by_id(self, settlement_id: int) -> dict | None:
+        for row in self.get_all_settlements():
+            if str(row.get("ID")) == str(settlement_id):
+                return row
+        return None
+
+    def update_settlement_field(self, settlement_id: int, field: str, value) -> bool:
+        row_idx = self.find_settlement_row_by_id(settlement_id)
+        if row_idx is None:
+            return False
+        if field not in SETTLEMENT_HEADERS:
+            return False
+        col_idx = SETTLEMENT_HEADERS.index(field) + 1
+        write_value = str(value) if field in SETTLEMENT_ID_LIKE_FIELDS else value
+        if field == "金額円":
+            write_value = float(value)
+        cell = gspread.utils.rowcol_to_a1(row_idx, col_idx)
+        self.settlement_ws.update([[write_value]], range_name=cell, raw=True)
+        return True
+
+    # ---------- AuditLog ----------
+
+    def _next_audit_id(self) -> int:
+        ids = self.audit_ws.col_values(1)[1:]
+        nums = [int(x) for x in ids if str(x).isdigit()]
+        return max(nums, default=0) + 1
+
+    def add_audit_log(
+        self,
+        actor_id: str,
+        target: str,
+        target_id: str,
+        action: str,
+        before: str = "",
+        after: str = "",
+        memo: str = "",
+    ) -> int:
+        audit_id = self._next_audit_id()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.audit_ws.append_row(
+            [
+                audit_id,
+                now,
+                str(actor_id),
+                target,
+                str(target_id),
+                action,
+                before,
+                after,
+                memo,
+            ],
+            value_input_option="RAW",
+        )
+        return audit_id
+
+    def get_recent_audit_logs(self, limit: int = 20) -> list[dict]:
+        records = self.audit_ws.get_all_records(
+            numericise_ignore=_id_column_indexes(AUDIT_HEADERS, AUDIT_ID_LIKE_FIELDS)
+        )
+        for row in records:
+            for field in AUDIT_ID_LIKE_FIELDS:
+                row[field] = _clean_id_text(row.get(field, ""))
+        return list(reversed(records[-max(1, int(limit)):]))
