@@ -3,7 +3,7 @@ TabiLog Bot - 世界一周の費用ログ用Discord Bot
 
 コマンド一覧:
   /log_ex      支出を記録（金額入力→タグ/割り勘を1画面で選択）
-  /log_in      予算を記録（金額入力→タグを1画面で選択）
+  /log_in      予算を記録（実行者の個人予算として保存）
   /log_memo    自分用の買い物メモを記録
   /log_memo_ls 自分の買い物メモ一覧（自分だけに表示）
   /log_memo_rm 自分の買い物メモを削除
@@ -17,6 +17,8 @@ TabiLog Bot - 世界一周の費用ログ用Discord Bot
   /log_ed      IDを指定して記録を確認・修正
   /log_rm      IDを複数指定して削除
   /log_wari    割り勘の精算計算（メンションあり）
+  /log_settle  現在の割り勘精算を建て替え確定として保存
+  /log_settle_ls 最新の建て替え確定を再表示
 """
 import asyncio
 import datetime
@@ -172,6 +174,130 @@ def _split_burden_ids(entry: dict) -> list[str]:
     入っていなければ全額立て替え（参加者だけが負担）。
     """
     return _participant_ids(entry)
+
+
+def _budget_owner_id(entry: dict) -> str | None:
+    """予算の所有者。空なら共有予算（旧データ互換）。"""
+    return _valid_discord_id(entry.get("予算ユーザーID", ""))
+
+
+def _entry_burden_for_user(entry: dict, user_id: str) -> float:
+    """ユーザーの実質負担額（円）。
+
+    割り勘ON: 参加者に含まれていれば人数で等分。
+    割り勘OFFの支出: 支払者が本人なら全額。
+    予算は 0。
+    """
+    if not _is_expense_entry(entry):
+        return 0.0
+    try:
+        amount = float(entry.get("円換算額") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if entry.get("割り勘") == "ON":
+        parts = _split_burden_ids(entry)
+        if user_id in parts and parts:
+            return amount / len(parts)
+        return 0.0
+    payer = _valid_discord_id(entry.get("支払者ID", ""))
+    if payer == user_id:
+        return amount
+    return 0.0
+
+
+def _personal_budget_total(entries: list[dict], user_id: str) -> float:
+    """所有者=user_id の予算合計（共有予算は含めない）。"""
+    total = 0.0
+    for e in entries:
+        if not _is_budget_entry(e):
+            continue
+        owner = _budget_owner_id(e)
+        if owner != user_id:
+            continue
+        try:
+            total += float(e.get("円換算額") or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _personal_burden_total(entries: list[dict], user_id: str) -> float:
+    return sum(_entry_burden_for_user(e, user_id) for e in entries)
+
+
+def _compute_wari_transactions(
+    entries: list[dict], country: str | None = None
+) -> tuple[list[tuple[str, str, float]], list[str], list[dict]]:
+    """割り勘精算の送金リストを返す。
+
+    Returns:
+        transactions: (債務者ID, 債権者ID, 金額)
+        invalid_entry_ids
+        split_entries: 対象にした支出行
+    """
+    split_entries = [
+        e
+        for e in entries
+        if e.get("割り勘") == "ON"
+        and _is_expense_entry(e)
+        and (not country or e.get("国") == country)
+    ]
+    balance: dict[str, float] = defaultdict(float)
+    invalid_entry_ids: list[str] = []
+
+    for e in split_entries:
+        participants = _split_burden_ids(e)
+        payer = _valid_discord_id(e.get("支払者ID", ""))
+        burden = list(dict.fromkeys(participants))
+        debtors = [p for p in burden if p != payer]
+        if not payer or not debtors:
+            invalid_entry_ids.append(str(e.get("ID", "?")))
+            continue
+        try:
+            amount = float(e["円換算額"])
+        except (TypeError, ValueError, KeyError):
+            invalid_entry_ids.append(str(e.get("ID", "?")))
+            continue
+        share = amount / len(burden)
+        for p in debtors:
+            balance[p] -= share
+            balance[payer] += share
+
+    debtor_list = sorted(
+        [[uid, bal] for uid, bal in balance.items() if bal < -0.5],
+        key=lambda x: x[1],
+    )
+    creditor_list = sorted(
+        [[uid, bal] for uid, bal in balance.items() if bal > 0.5],
+        key=lambda x: -x[1],
+    )
+    transactions: list[tuple[str, str, float]] = []
+    di = ci = 0
+    while di < len(debtor_list) and ci < len(creditor_list):
+        pay = min(-debtor_list[di][1], creditor_list[ci][1])
+        transactions.append((debtor_list[di][0], creditor_list[ci][0], pay))
+        debtor_list[di][1] += pay
+        creditor_list[ci][1] -= pay
+        if abs(debtor_list[di][1]) < 1:
+            di += 1
+        if abs(creditor_list[ci][1]) < 1:
+            ci += 1
+    return transactions, invalid_entry_ids, split_entries
+
+
+def _format_settlement_lines(rows: list[dict]) -> str:
+    lines = []
+    for row in rows:
+        debtor = _valid_discord_id(row.get("債務者ID", ""))
+        creditor = _valid_discord_id(row.get("債権者ID", ""))
+        try:
+            amount = float(row.get("金額円") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if not debtor or not creditor:
+            continue
+        lines.append(f"<@{debtor}> → <@{creditor}> に {amount:,.0f}円")
+    return "\n".join(lines) if lines else "（送金なし）"
 
 
 def _resolve_currency(
@@ -361,6 +487,12 @@ class EntryModal(discord.ui.Modal):
 
         try:
             # タグ・割り勘は次の1画面で選ぶので、いったん空/OFFで保存する
+            # 予算は実行者の個人予算として所有者を付与する
+            budget_owner_id = (
+                str(interaction.user.id)
+                if self.entry_type in ENTRY_TYPE_BUDGET_ALIASES
+                else ""
+            )
             entry_id = await run_sync(
                 st.add_entry,
                 entry_type=self.entry_type,
@@ -376,6 +508,7 @@ class EntryModal(discord.ui.Modal):
                 payer_id="",
                 participants="",
                 recorded_at=recorded_at,
+                budget_owner_id=budget_owner_id,
             )
             tags = await run_sync(st.list_tags)
         except Exception as e:
@@ -1437,9 +1570,12 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
 
     expense_entries = [e for e in filtered if _is_expense_entry(e)]
     budget_entries = [e for e in filtered if _is_budget_entry(e)]
-    total_expense = sum(e["円換算額"] for e in expense_entries)
-    total_budget = sum(e["円換算額"] for e in budget_entries)
-    balance = total_budget - total_expense
+    total_expense = sum(float(e["円換算額"]) for e in expense_entries)
+    total_budget = sum(float(e["円換算額"]) for e in budget_entries)
+    my_id = str(interaction.user.id)
+    personal_burden = _personal_burden_total(filtered, my_id)
+    personal_budget = _personal_budget_total(filtered, my_id)
+    personal_balance = personal_budget - personal_burden
     expense_with_memo = total_expense + memo_total
 
     title_parts = []
@@ -1451,12 +1587,31 @@ async def log_sum(interaction: discord.Interaction, country: str | None = None, 
 
     embed = discord.Embed(title=f"📊 集計: {title}", color=discord.Color.blue())
     embed.add_field(
-        name="支出合計（円）",
+        name="支出合計（円・共有ログ）",
         value=f"{total_expense:,.0f}円（メモ込み: {expense_with_memo:,.0f}円）",
         inline=True,
     )
-    embed.add_field(name="残高（予算 − 支出）", value=f"{balance:,.0f}円", inline=True)
+    embed.add_field(
+        name="個人残高（自分の予算 − 実質負担）",
+        value=f"{personal_balance:,.0f}円",
+        inline=True,
+    )
     embed.add_field(name="件数", value=f"{len(filtered)}件", inline=True)
+    embed.add_field(
+        name="自分の実質負担",
+        value=f"{personal_burden:,.0f}円",
+        inline=True,
+    )
+    embed.add_field(
+        name="自分の個人予算",
+        value=f"{personal_budget:,.0f}円",
+        inline=True,
+    )
+    embed.add_field(
+        name="共有予算合計（参考）",
+        value=f"{total_budget:,.0f}円",
+        inline=True,
+    )
     if memo_total > 0:
         embed.add_field(
             name="自分の買い物メモ",
@@ -1531,17 +1686,22 @@ async def log_all(interaction: discord.Interaction):
     memo_by_user = _memo_totals_by_user(all_memos, require_include=True)
     name_of = await _build_name_resolver(interaction.guild, set(memo_by_user.keys()))
 
+    # 個人視点（実質負担・個人予算。÷2は使わない）
+    personal_burden = _personal_burden_total(entries, my_id)
+    personal_budget = _personal_budget_total(entries, my_id)
+    personal_balance = personal_budget - personal_burden
+
     embed = discord.Embed(
         title="🌍 全体サマリー",
         color=discord.Color.purple(),
     )
 
-    # 1) MEMO抜き
+    # 1) MEMO抜き（共有・国別は従来どおり維持）
     if aggregated:
         no_memo_lines = [
             f"支出: {total_expense:,.0f}円",
             f"予算: {total_budget:,.0f}円",
-            f"残高: {total_budget - total_expense:,.0f}円",
+            f"残高（共有予算 − 共有支出）: {total_budget - total_expense:,.0f}円",
         ]
         country_lines = [
             f"{c}: {v:,.0f}円"
@@ -1580,16 +1740,42 @@ async def log_all(interaction: discord.Interaction):
             inline=False,
         )
 
-    # 3) 自分のMEMO込（共有支出は2人割り想定で半分）
-    shared_half = float(total_expense) / 2
+    # 3) 実行者の実質負担（÷2は使わない）
     embed.add_field(
-        name="③ 自分のMEMO込（集計対象ON）",
+        name="③ 自分の実質負担・個人予算",
         value=(
-            f"共有支出÷2 {shared_half:,.0f}円 + 自分のメモ {my_memo_total:,.0f}円\n"
-            f"= **{shared_half + my_memo_total:,.0f}円**"
+            f"実質負担（割り勘等分込み）: {personal_burden:,.0f}円\n"
+            f"個人予算: {personal_budget:,.0f}円\n"
+            f"個人残高: **{personal_balance:,.0f}円**\n"
+            f"自分のメモ（集計対象ON）: {my_memo_total:,.0f}円"
         ),
         inline=False,
     )
+
+    # 4) 最新の建て替え確定
+    latest = await run_sync(st.get_latest_settlement_batch)
+    if latest:
+        settled_at = str(latest[0].get("確定日", "")).strip() or "不明"
+        batch_id = str(latest[0].get("バッチID", "")).strip()
+        country_f = str(latest[0].get("国フィルタ", "")).strip()
+        memo = str(latest[0].get("メモ", "")).strip()
+        settle_lines = [_format_settlement_lines(latest)]
+        meta = f"確定日: {settled_at} / バッチ #{batch_id}"
+        if country_f:
+            meta += f" / 国: {country_f}"
+        if memo:
+            meta += f"\nメモ: {memo}"
+        embed.add_field(
+            name="④ 建て替え確定（最新）",
+            value=f"{meta}\n{settle_lines[0]}",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="④ 建て替え確定（最新）",
+            value="まだありません。`/log_settle` で現在の `/log_wari` 結果を保存できます。",
+            inline=False,
+        )
 
     await interaction.followup.send(embed=embed)
 
@@ -1640,6 +1826,7 @@ EDIT_FIELDS = [
     ("割り勘ON/OFF", "割り勘"),
     ("支払者", "支払者ID"),
     ("参加者", "参加者ID"),
+    ("予算の所有者", "予算ユーザーID"),
 ]
 
 DATETIME_FORMATS = (
@@ -1712,6 +1899,14 @@ def _entry_detail_embed(entry: dict) -> discord.Embed:
         )
     else:
         embed.add_field(name="参加者", value="（未設定）", inline=False)
+
+    budget_owner = _budget_owner_id(entry)
+    if _is_budget_entry(entry) or budget_owner:
+        embed.add_field(
+            name="予算の所有者",
+            value=_mention_or_raw(budget_owner or "") if budget_owner else "（共有・未設定）",
+            inline=True,
+        )
 
     embed.set_footer(text="下のメニューから修正する項目を選んでください")
     return embed
@@ -1815,6 +2010,22 @@ async def _apply_field_update(
         await reply(f"✅ ID {entry_id} の参加者を更新しました: {names}")
         return True
 
+    if field == "予算ユーザーID":
+        ids = _parse_mentions(value) or ([value] if _valid_discord_id(value) else [])
+        if value.strip() in ("", "-", "共有", "なし"):
+            await run_sync(st.update_field, entry_id, "予算ユーザーID", "")
+            await reply(f"✅ ID {entry_id} の予算所有者を共有（未設定）にしました。")
+            return True
+        if not ids:
+            await reply(
+                "所有者は @ユーザー名 で指定するか、`共有` でクリアしてください。",
+                ephemeral=True,
+            )
+            return False
+        await run_sync(st.update_field, entry_id, "予算ユーザーID", ids[0])
+        await reply(f"✅ ID {entry_id} の予算所有者を <@{ids[0]}> にしました。")
+        return True
+
     ok = await run_sync(st.update_field, entry_id, field, value)
     if ok:
         await reply(f"✅ ID {entry_id} の「{field}」を更新しました: {value}")
@@ -1834,6 +2045,7 @@ class EditValueModal(discord.ui.Modal):
             "国": "国",
             "支払者ID": "支払者（@メンション）",
             "参加者ID": "参加者（@メンション 複数可）",
+            "予算ユーザーID": "所有者（@メンション / 共有）",
         }
         super().__init__(title=f"ID {entry_id}: {labels.get(field, field)} を編集")
         self.entry_id = entry_id
@@ -1842,6 +2054,8 @@ class EditValueModal(discord.ui.Modal):
 
         default = str(current or "")
         if field == "支払者ID" and _valid_discord_id(default):
+            default = f"<@{default}>"
+        elif field == "予算ユーザーID" and _valid_discord_id(default):
             default = f"<@{default}>"
         elif field == "参加者ID":
             ids = _participant_ids({"参加者ID": default})
@@ -1932,6 +2146,7 @@ class EditFieldView(discord.ui.View):
             "タグ": self.target.get("タグ", ""),
             "メモ": self.target.get("メモ", ""),
             "国": self.target.get("国", ""),
+            "予算ユーザーID": self.target.get("予算ユーザーID", ""),
         }
         await interaction.response.send_modal(
             EditValueModal(
@@ -2076,62 +2291,29 @@ async def log_rm(interaction: discord.Interaction, ids: str):
     await interaction.followup.send("\n".join(messages), ephemeral=not deleted)
 
 
-@bot.tree.command(name="log_wari", description="割り勘の精算額を計算します")
+@bot.tree.command(name="log_wari", description="割り勘の精算額を計算します（ライブ）")
 @app_commands.describe(country="絞り込む国（省略可）")
 async def log_wari(interaction: discord.Interaction, country: str | None = None):
     await interaction.response.defer()
-    entries = await run_sync(get_store().get_all_entries)
-
-    split_entries = [
-        e for e in entries
-        if e.get("割り勘") == "ON" and _is_expense_entry(e) and (not country or e.get("国") == country)
-    ]
+    st = get_store()
+    entries = await run_sync(st.get_all_entries)
+    transactions, invalid_entry_ids, split_entries = _compute_wari_transactions(
+        entries, country
+    )
 
     if not split_entries:
         await interaction.followup.send("割り勘対象の記録がありませんでした。")
         return
 
-    balance = defaultdict(float)  # user_id -> balance (プラス=貰える, マイナス=払う)
-    invalid_entry_ids = []
+    title = f"💰 割り勘精算（ライブ）" + (f"（{country}）" if country else "")
+    embed = discord.Embed(title=title, color=discord.Color.gold())
 
-    for e in split_entries:
-        participants = _split_burden_ids(e)
-        payer = _valid_discord_id(e.get("支払者ID", ""))
-        # 負担者 = 参加者のみ。支払者が別人なら立て替え（全額を参加者が負担）。
-        burden = list(dict.fromkeys(participants))
-        debtors = [p for p in burden if p != payer]
-        if not payer or not debtors:
-            invalid_entry_ids.append(str(e.get("ID", "?")))
-            continue
-        amount = float(e["円換算額"])
-        share = amount / len(burden)
-        for p in debtors:
-            balance[p] -= share
-            balance[payer] += share
-
-    # 貸し借りを最小回数の送金に整理する（貪欲法）
-    debtors = sorted([(uid, bal) for uid, bal in balance.items() if bal < -0.5], key=lambda x: x[1])
-    creditors = sorted([(uid, bal) for uid, bal in balance.items() if bal > 0.5], key=lambda x: -x[1])
-
-    transactions = []
-    di, ci = 0, 0
-    debtors = [list(x) for x in debtors]
-    creditors = [list(x) for x in creditors]
-
-    while di < len(debtors) and ci < len(creditors):
-        debt_uid, debt_amt = debtors[di]
-        cred_uid, cred_amt = creditors[ci]
-        pay = min(-debt_amt, cred_amt)
-        transactions.append((debt_uid, cred_uid, pay))
-        debtors[di][1] += pay
-        creditors[ci][1] -= pay
-        if abs(debtors[di][1]) < 1:
-            di += 1
-        if abs(creditors[ci][1]) < 1:
-            ci += 1
-
-    if not transactions:
-        if invalid_entry_ids:
+    if transactions:
+        embed.description = "\n".join(
+            f"<@{a}> → <@{b}> に {amt:,.0f}円" for a, b, amt in transactions
+        )
+    else:
+        if invalid_entry_ids and len(invalid_entry_ids) == len(split_entries):
             ids = ", ".join(invalid_entry_ids)
             await interaction.followup.send(
                 f"⚠️ ID {ids} の参加者データが破損しています。"
@@ -2139,12 +2321,7 @@ async def log_wari(interaction: discord.Interaction, country: str | None = None)
                 ephemeral=True,
             )
             return
-        await interaction.followup.send("精算の必要はありません（すでに帳尻が合っています）。")
-        return
-
-    lines = [f"<@{a}> → <@{b}> に {amt:,.0f}円" for a, b, amt in transactions]
-    title = f"💰 割り勘精算" + (f"（{country}）" if country else "")
-    embed = discord.Embed(title=title, description="\n".join(lines), color=discord.Color.gold())
+        embed.description = "精算の必要はありません（すでに帳尻が合っています）。"
 
     split_by_currency = _currency_totals(split_entries, "支出")
     if split_by_currency:
@@ -2158,10 +2335,122 @@ async def log_wari(interaction: discord.Interaction, country: str | None = None)
     total_jpy = sum(float(e["円換算額"]) for e in valid_entries)
     embed.add_field(name="割り勘対象合計（円）", value=f"{total_jpy:,.0f}円", inline=False)
 
+    latest = await run_sync(st.get_latest_settlement_batch)
+    if latest:
+        settled_at = str(latest[0].get("確定日", "")).strip() or "不明"
+        batch_id = str(latest[0].get("バッチID", "")).strip()
+        embed.add_field(
+            name="参考: 最新の建て替え確定",
+            value=(
+                f"確定日 {settled_at} / バッチ #{batch_id}\n"
+                f"{_format_settlement_lines(latest)}\n"
+                "再表示は `/log_settle_ls`、新規確定は `/log_settle`"
+            ),
+            inline=False,
+        )
+    else:
+        embed.set_footer(text="この結果を確定保存するなら /log_settle")
+
     if invalid_entry_ids:
         embed.set_footer(
-            text=f"参加者データ破損のため除外: ID {', '.join(invalid_entry_ids)}"
+            text=(
+                (embed.footer.text + " / " if embed.footer and embed.footer.text else "")
+                + f"参加者データ破損のため除外: ID {', '.join(invalid_entry_ids)}"
+            )
         )
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(
+    name="log_settle",
+    description="現在の割り勘精算を建て替え確定として保存します",
+)
+@app_commands.describe(
+    country="絞り込む国（省略可）",
+    memo="確定メモ（任意）",
+)
+async def log_settle(
+    interaction: discord.Interaction,
+    country: str | None = None,
+    memo: str | None = None,
+):
+    await interaction.response.defer()
+    st = get_store()
+    entries = await run_sync(st.get_all_entries)
+    transactions, invalid_entry_ids, split_entries = _compute_wari_transactions(
+        entries, country
+    )
+    if not split_entries:
+        await interaction.followup.send("割り勘対象の記録がありませんでした。")
+        return
+    if not transactions:
+        await interaction.followup.send(
+            "精算の必要がないため、確定スナップショットは保存しませんでした。"
+            + (
+                f"（除外ID: {', '.join(invalid_entry_ids)}）"
+                if invalid_entry_ids
+                else ""
+            ),
+        )
+        return
+
+    batch_id = await run_sync(
+        st.add_settlement_batch,
+        transactions=transactions,
+        creator_id=str(interaction.user.id),
+        memo=(memo or "").strip(),
+        country_filter=(country or "").strip(),
+    )
+    latest = await run_sync(st.get_latest_settlement_batch)
+    settled_at = str(latest[0].get("確定日", "")).strip() if latest else ""
+    embed = discord.Embed(
+        title="✅ 建て替えを確定保存しました",
+        description=_format_settlement_lines(latest),
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="バッチID", value=str(batch_id), inline=True)
+    embed.add_field(name="確定日", value=settled_at or "—", inline=True)
+    if country:
+        embed.add_field(name="国フィルタ", value=country, inline=True)
+    if memo:
+        embed.add_field(name="メモ", value=memo, inline=False)
+    if invalid_entry_ids:
+        embed.set_footer(
+            text=f"計算から除外したID: {', '.join(invalid_entry_ids)}"
+        )
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(
+    name="log_settle_ls",
+    description="最新の建て替え確定スナップショットを再表示します",
+)
+async def log_settle_ls(interaction: discord.Interaction):
+    await interaction.response.defer()
+    latest = await run_sync(get_store().get_latest_settlement_batch)
+    if not latest:
+        await interaction.followup.send(
+            "建て替え確定はまだありません。`/log_settle` で保存してください。"
+        )
+        return
+    settled_at = str(latest[0].get("確定日", "")).strip() or "不明"
+    batch_id = str(latest[0].get("バッチID", "")).strip()
+    country_f = str(latest[0].get("国フィルタ", "")).strip()
+    memo = str(latest[0].get("メモ", "")).strip()
+    creator = _valid_discord_id(latest[0].get("作成者ID", ""))
+    embed = discord.Embed(
+        title="📌 建て替え確定（最新）",
+        description=_format_settlement_lines(latest),
+        color=discord.Color.dark_gold(),
+    )
+    embed.add_field(name="確定日", value=settled_at, inline=True)
+    embed.add_field(name="バッチID", value=batch_id or "—", inline=True)
+    if country_f:
+        embed.add_field(name="国フィルタ", value=country_f, inline=True)
+    if creator:
+        embed.add_field(name="作成者", value=f"<@{creator}>", inline=True)
+    if memo:
+        embed.add_field(name="メモ", value=memo, inline=False)
     await interaction.followup.send(embed=embed)
 
 

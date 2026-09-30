@@ -1,10 +1,11 @@
 """
 Google Sheets 操作モジュール
 使うタブ:
-  - "Log"      : 収支の記録本体
-  - "Channels" : チャンネルID <-> 国 の紐付け
-  - "Tags"     : 選択用タグ一覧
-  - "Memos"    : ユーザー固有の買い物メモ
+  - "Log"         : 収支の記録本体
+  - "Channels"    : チャンネルID <-> 国 の紐付け
+  - "Tags"        : 選択用タグ一覧
+  - "Memos"       : ユーザー固有の買い物メモ
+  - "Settlements" : 建て替え確定スナップショット
 存在しない場合は自動で作成する。
 
 【重要】DiscordのIDは18〜19桁なので、Sheetsには必ずRAW文字列として書き込む。
@@ -28,6 +29,7 @@ LOG_HEADERS = [
     "ID", "種別", "日時", "チャンネルID", "国",
     "現地金額", "通貨", "レート", "円換算額",
     "タグ", "メモ", "割り勘", "支払者ID", "参加者ID", "集計対象",
+    "予算ユーザーID",
 ]
 CHANNEL_HEADERS = ["チャンネルID", "国", "通貨"]
 TAG_HEADERS = ["タグ"]
@@ -35,9 +37,14 @@ MEMO_HEADERS = [
     "ID", "日時", "ユーザーID", "国",
     "現地金額", "通貨", "レート", "円換算額", "メモ", "集計対象",
 ]
+SETTLEMENT_HEADERS = [
+    "ID", "確定日", "バッチID", "債務者ID", "債権者ID", "金額円",
+    "メモ", "作成者ID", "国フィルタ",
+]
 
-ID_LIKE_FIELDS = {"チャンネルID", "支払者ID", "参加者ID"}
+ID_LIKE_FIELDS = {"チャンネルID", "支払者ID", "参加者ID", "予算ユーザーID"}
 MEMO_ID_LIKE_FIELDS = {"ユーザーID"}
+SETTLEMENT_ID_LIKE_FIELDS = {"債務者ID", "債権者ID", "作成者ID"}
 
 
 def _get_client():
@@ -84,9 +91,11 @@ class SheetStore:
         self.channel_ws = self._get_or_create_ws("Channels", CHANNEL_HEADERS)
         self.tag_ws = self._get_or_create_ws("Tags", TAG_HEADERS)
         self.memo_ws = self._get_or_create_ws("Memos", MEMO_HEADERS)
+        self.settlement_ws = self._get_or_create_ws("Settlements", SETTLEMENT_HEADERS)
         self._ensure_log_headers()
         self._ensure_channel_headers()
         self._ensure_memo_headers()
+        self._ensure_settlement_headers()
         self._ensure_default_tags()
 
     def _ensure_channel_headers(self):
@@ -118,6 +127,16 @@ class SheetStore:
         missing = [h for h in MEMO_HEADERS if h not in first_row]
         if missing:
             self.memo_ws.update([first_row + missing], "A1", raw=True)
+
+    def _ensure_settlement_headers(self):
+        """既存Settlementsシートに新列が無ければヘッダーを拡張する。"""
+        first_row = self.settlement_ws.row_values(1)
+        if not first_row:
+            self.settlement_ws.append_row(SETTLEMENT_HEADERS, value_input_option="RAW")
+            return
+        missing = [h for h in SETTLEMENT_HEADERS if h not in first_row]
+        if missing:
+            self.settlement_ws.update([first_row + missing], "A1", raw=True)
 
     def _get_or_create_ws(self, title, headers):
         try:
@@ -215,6 +234,7 @@ class SheetStore:
         participants: str,
         recorded_at: str | None = None,
         include_in_sum: bool = False,
+        budget_owner_id: str = "",
     ) -> int:
         new_id = self._next_id()
         now = recorded_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -225,6 +245,7 @@ class SheetStore:
             str(payer_id) if payer_id else "",
             str(participants),
             "ON" if include_in_sum else "OFF",
+            str(budget_owner_id) if budget_owner_id else "",
         ]
         self.log_ws.append_row(row, value_input_option="RAW")
         return new_id
@@ -237,6 +258,8 @@ class SheetStore:
         for row in records:
             for field in ID_LIKE_FIELDS:
                 row[field] = _clean_id_text(row.get(field, ""))
+            if "予算ユーザーID" not in row:
+                row["予算ユーザーID"] = ""
         return records
 
     def find_row_by_id(self, entry_id: int) -> int | None:
@@ -391,3 +414,87 @@ class SheetStore:
             return False
         self.memo_ws.delete_rows(row_idx)
         return True
+
+    # ---------- Settlements (建て替え確定スナップショット) ----------
+
+    def _next_settlement_id(self) -> int:
+        ids = self.settlement_ws.col_values(1)[1:]
+        nums = [int(x) for x in ids if str(x).isdigit()]
+        return max(nums, default=0) + 1
+
+    def _next_settlement_batch_id(self) -> int:
+        records = self.get_all_settlements()
+        nums = []
+        for row in records:
+            raw = str(row.get("バッチID", "")).strip()
+            if raw.isdigit():
+                nums.append(int(raw))
+        return max(nums, default=0) + 1
+
+    def add_settlement_batch(
+        self,
+        transactions: list[tuple[str, str, float]],
+        creator_id: str,
+        memo: str = "",
+        country_filter: str = "",
+        settled_at: str | None = None,
+    ) -> int:
+        """送金リストを1バッチとして保存。バッチIDを返す。"""
+        if not transactions:
+            raise ValueError("transactions must not be empty")
+        batch_id = self._next_settlement_batch_id()
+        now = settled_at or datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        rows = []
+        next_id = self._next_settlement_id()
+        for debtor_id, creditor_id, amount in transactions:
+            rows.append([
+                next_id,
+                now,
+                batch_id,
+                str(debtor_id),
+                str(creditor_id),
+                float(amount),
+                memo,
+                str(creator_id),
+                country_filter or "",
+            ])
+            next_id += 1
+        self.settlement_ws.append_rows(rows, value_input_option="RAW")
+        return batch_id
+
+    def get_all_settlements(self) -> list[dict]:
+        records = self.settlement_ws.get_all_records(
+            numericise_ignore=_id_column_indexes(
+                SETTLEMENT_HEADERS, SETTLEMENT_ID_LIKE_FIELDS
+            )
+        )
+        for row in records:
+            for field in SETTLEMENT_ID_LIKE_FIELDS:
+                row[field] = _clean_id_text(row.get(field, ""))
+            try:
+                row["金額円"] = float(row.get("金額円") or 0)
+            except (TypeError, ValueError):
+                row["金額円"] = 0.0
+        return records
+
+    def get_latest_settlement_batch(self) -> list[dict]:
+        """最新バッチの行一覧（確定日・バッチIDが最大のもの）。"""
+        records = self.get_all_settlements()
+        if not records:
+            return []
+        best_key = None
+        best_batch = ""
+        for row in records:
+            batch = str(row.get("バッチID", "")).strip()
+            settled = str(row.get("確定日", "")).strip()
+            try:
+                batch_num = int(batch) if batch.isdigit() else -1
+            except ValueError:
+                batch_num = -1
+            key = (settled, batch_num)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_batch = batch
+        if not best_batch:
+            return []
+        return [r for r in records if str(r.get("バッチID", "")).strip() == best_batch]
